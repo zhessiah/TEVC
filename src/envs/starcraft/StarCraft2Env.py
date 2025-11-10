@@ -302,6 +302,7 @@ class StarCraft2Env(MultiAgentEnv):
         self._run_config = run_configs.get(version=self.game_version)
         _map = maps.get(self.map_name)
 
+
         # Setting up the interface
         interface_options = sc_pb.InterfaceOptions(raw=True, score=False)
         self._sc2_proc = self._run_config.start(window_size=self.window_size, want_rgb=False)
