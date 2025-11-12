@@ -14,6 +14,7 @@ from runners import REGISTRY as r_REGISTRY
 from controllers import REGISTRY as mac_REGISTRY
 from components.episode_buffer import ReplayBuffer
 from components.transforms import OneHot
+from components.Evolver import NN_Evolver
 
 from smac.env import StarCraft2Env
 
@@ -148,12 +149,37 @@ def run_sequential(args, logger):
                           device="cpu" if args.buffer_cpu_only else args.device)
     # Setup multiagent controller here
     mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+    
+    evolver = NN_Evolver(args)
+
+    # Setup populations of multiagent controller here
+    if args.EA:
+        population = []
+        for i in range(args.pop_size):
+            population.append(mac_REGISTRY[args.mac](buffer.scheme, groups, args))
+        pop_size = args.pop_size
+        elite_size = args.elite_size 
+        fitness = []  
+        best_agents = list(range(int(pop_size*elite_size)))
+    
+    else:
+        mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+        population = []
+    
+    
+    
+    
+    
 
     # Give runner the scheme
     runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
 
     # Learner
-    learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
+    if args.EA:
+        learner = le_REGISTRY[args.learner](mac, population, buffer.scheme, logger, args)
+    else:
+        learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
+    
 
     if args.use_cuda:
         learner.cuda()
@@ -203,13 +229,19 @@ def run_sequential(args, logger):
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
 
     while runner.t_env <= args.t_max:
-
+        
         # Run for a whole episode at a time
+        if args.EA:
+            with th.no_grad():
+                for i in best_agents:
+                    episode_batch = runner.run(population[i], test_mode=False)
+                    buffer.insert_episode_batch(episode_batch)
+
+        # episode_batch = runner.run(test_mode=False)
         with th.no_grad():
-            episode_batch = runner.run(test_mode=False)
+            episode_batch = runner.run(mac, test_mode=False)
             buffer.insert_episode_batch(episode_batch)
-            
-            
+
         if buffer.can_sample(args.batch_size):
             next_episode = episode + args.batch_size_run
             if args.accumulated_episodes and next_episode % args.accumulated_episodes != 0:

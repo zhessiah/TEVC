@@ -67,4 +67,8 @@ attack_method: "noise"
 epsilon: 1
 verbose: False
 
+
+# --- Evolution settings ---
+EA: True
+
 run: "default"
