@@ -83,6 +83,188 @@ class EvoQLearner:
         Returns the total number of parameters in the model as an integer
         """
         return int(sum(p.numel() for p in self.params if hasattr(p, 'numel')))
+    
+    
+    def calculate_TD_error(self, batch: EpisodeBatch, mac_index: int):
+        """
+        Calculate TD error for a specific MAC in the population.
+        Exactly follows the TD error computation logic in train() function.
+        
+        Args:
+            batch: EpisodeBatch containing experience data
+            mac_index: Index of the MAC in self.population to evaluate
+            
+        Returns:
+            mean_td_error: Mean TD error for the specified MAC (scalar tensor)
+        """
+        # Get the MAC from population
+        pop_mac = self.population[mac_index]
+        
+        # Get the relevant quantities (same as in train())
+        rewards = batch["reward"][:, :-1]
+        actions = batch["actions"][:, :-1]
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        avail_actions = batch["avail_actions"]
+        
+        # Calculate estimated Q-Values using the population MAC
+        pop_mac.agent.eval()  # Set to eval mode for evaluation
+        mac_out = []
+        pop_mac.init_hidden(batch.batch_size)
+        
+        with th.no_grad():  # No gradients needed for evaluation
+            for t in range(batch.max_seq_length):
+                agent_outs = pop_mac.forward(batch, t=t)
+                mac_out.append(agent_outs)
+        
+        mac_out = th.stack(mac_out, dim=1)  # (batch, seq_len, n_agents, n_actions)
+        
+        # Pick the Q-Values for the actions taken by each agent
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
+        
+        # Calculate the Q-Values necessary for the target 
+        with th.no_grad():
+            self.target_mac.agent.eval()  # no need to backward
+            target_mac_out = []
+            self.target_mac.init_hidden(batch.batch_size)
+            for t in range(batch.max_seq_length):
+                target_agent_outs = self.target_mac.forward(batch, t=t)
+                target_mac_out.append(target_agent_outs)
+
+            # We don't need the first timesteps Q-Value estimate for calculating targets
+            target_mac_out = th.stack(target_mac_out, dim=1)  # Concat across time
+
+            # Max over target Q-Values/ Double q learning 
+            mac_out_detach = mac_out.clone().detach()
+            mac_out_detach[avail_actions == 0] = -9999999
+            cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
+            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
+            
+            # Calculate n-step Q-Learning targets 
+            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"])
+
+            if getattr(self.args, 'q_lambda', False):
+                qvals = th.gather(target_mac_out, 3, batch["actions"]).squeeze(3)
+                qvals = self.target_mixer(qvals, batch["state"])
+
+                targets = build_q_lambda_targets(rewards, terminated, mask, target_max_qvals, qvals,
+                                    self.args.gamma, self.args.td_lambda)
+            else:
+                targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
+                                                    self.args.n_agents, self.args.gamma, self.args.td_lambda)
+
+        # Mixer 
+        with th.no_grad():
+            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
+
+        # Calculate TD error 
+        td_error = (chosen_action_qvals - targets.detach())
+        td_error2 = 0.5 * td_error.pow(2)
+
+        mask = mask.expand_as(td_error2)
+        masked_td_error = td_error2 * mask
+
+        # Calculate mean TD error 
+        mean_td_error = masked_td_error.sum() / mask.sum()
+        
+        return mean_td_error
+
+
+    def calculate_confidence_Q(self, batch: EpisodeBatch, mac_index: int):
+        """
+        Calculate confidence Q metric for a specific MAC in the population.
+        Exactly follows the confidence Q computation logic in train() function.
+        
+        Args:
+            batch: EpisodeBatch containing experience data
+            mac_index: Index of the MAC in self.population to evaluate
+            
+        Returns:
+            mean_confidence_Q: Mean confidence Q for the specified MAC (scalar tensor)
+        """
+        # Get the MAC from population
+        pop_mac = self.population[mac_index]
+        
+        # Get the relevant quantities (same as in train())
+        rewards = batch["reward"][:, :-1]
+        actions = batch["actions"][:, :-1]
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        avail_actions = batch["avail_actions"]
+        
+        # Calculate estimated Q-Values using the population MAC
+        pop_mac.agent.eval()  # Set to eval mode for evaluation
+        mac_out = []
+        pop_mac.init_hidden(batch.batch_size)
+        
+        with th.no_grad():  # No gradients needed for evaluation
+            for t in range(batch.max_seq_length):
+                agent_outs = pop_mac.forward(batch, t=t)
+                mac_out.append(agent_outs)
+        
+        mac_out = th.stack(mac_out, dim=1)  # (batch, seq_len, n_agents, n_actions)
+        
+        # Compute confidence Q metric here (implementation depends on definition)
+        # Placeholder implementation:
+        confidence_Q_values = th.std(mac_out, dim=-1)  # Example: standard deviation across actions
+        
+        # Calculate mean confidence Q 
+        mean_confidence_Q = (confidence_Q_values * mask).sum() / mask.sum()
+        
+        return mean_confidence_Q
+
+
+    def calculate_adversarial_loss(self, batch: EpisodeBatch, mac_index: int):
+        """
+        Calculate robustness metrics for a specific MAC in the population.
+        Exactly follows the robustness computation logic in train() function.
+        
+        Args:
+            batch: EpisodeBatch containing experience data
+            mac_index: Index of the MAC in self.population to evaluate
+            
+        Returns:
+            adv_loss: Mean adversarial loss for the specified MAC (scalar tensor)
+        """
+        # Get the MAC from population
+        pop_mac = self.population[mac_index]
+        
+        # Get the relevant quantities for robust regularizer (same as in train())
+        adv_terminated = batch["terminated"].float()
+        adv_mask = batch["filled"].float()
+        adv_mask[:, 1:] = adv_mask[:, 1:] * (1 - adv_terminated[:, :-1])
+        
+        # Calculate estimated Q-Values using the population MAC
+        pop_mac.agent.eval()  # Set to eval mode for evaluation
+        mac_out = []
+        adv_margin = []
+        pop_mac.init_hidden(batch.batch_size)
+        
+        with th.no_grad():  # No gradients needed for evaluation
+            for t in range(batch.max_seq_length):
+                agent_outs = pop_mac.forward(batch, t=t)  # normal Q-values
+                mac_out.append(agent_outs)
+                
+                # Calculate adversarial margin
+                adv_batch = noise_atk(batch, self.args)
+                adv_agent_out = pop_mac.forward(adv_batch, t=t)
+                adv_margin.append(get_max_diff(agent_outs, adv_agent_out))
+        
+        # Calculate adversarial loss (EXACTLY as in train())
+        adv_margin = th.stack(adv_margin, dim=0).transpose(0, 1) * adv_mask.squeeze(2)  # (batch, seq_len)
+        adv_loss = adv_margin.sum() / adv_mask.sum()
+        
+        return adv_loss
+    
+    
+    def Evolve_pop(self):
+        """
+        Evolution operations for the population.
+        TODO: Implement evolution strategy (selection, crossover, mutation)
+        """
+        pass
         
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
         # Get the relevant quantities
