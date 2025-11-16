@@ -1,10 +1,33 @@
 import random
 import numpy as np
 import fastrand
+import torch
+from components.episode_buffer import EpisodeBatch
+from controllers import REGISTRY as mac_REGISTRY
+
 def is_lnorm_key(key):
     return key.startswith('lnorm')
 
-
+class Genome:
+    def __init__(self, args, buffer, groups):
+        self.mac1 = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+        self.mac2 = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+    def train(self):
+        self.mac1.agent.train()
+        self.mac2.agent.train()
+    def init_hidden(self):
+        self.mac1.init_hidden()
+        self.mac2.init_hidden()
+    def forward(self, batch: EpisodeBatch, t: int):
+        q1 = self.mac1.forward(batch, t)
+        q2 = self.mac2.forward(batch, t)
+        return torch.min(q1, q2)
+    def cuda(self):
+        self.mac1.cuda()
+        self.mac2.cuda()
+    def save_models(self, path):
+        torch.save(self.mac1.agent.state_dict(), "{}/agent1.th".format(path))
+        torch.save(self.mac2.agent.state_dict(), "{}/agent2.th".format(path))
 class NN_Evolver:
     def __init__(self, args):
         self.current_gen = 0
@@ -13,7 +36,7 @@ class NN_Evolver:
 
         self.frac = args.frac
         self.population_size = self.args.pop_size
-        self.num_elitists = int(self.args.elite_fraction * args.pop_size)
+        self.num_elitists = int(self.args.elite_size * args.pop_size)
         if self.num_elitists < 1: self.num_elitists = 1
 
         self.rl_policy = None
@@ -39,7 +62,7 @@ class NN_Evolver:
         if weight < -mag: weight = -mag
         return weight
 
-    def crossover_inplace(self, gene1, gene2, agent_index: int):
+    def crossover_inplace(self, gene1, gene2):
         # Evaluate the parents
 
         b_1 = None
@@ -74,7 +97,7 @@ class NN_Evolver:
 
         # Evaluate the children
 
-    def mutate_inplace(self, gene, agent_index, agent_level=False):
+    def mutate_inplace(self, gene, agent_level=False):
         trials = 5
 
         mut_strength = 0.1
@@ -124,9 +147,9 @@ class NN_Evolver:
                             # Regularization hard limit
                             W[index, :] = np.clip(W[index, :].cpu(), a_min=-1000000, a_max=1000000)
 
-    def clone(self, master, replacee, agent_index: int):  # Replace the replacee individual with master
+    def clone(self, master, replace):  # Replace the replacee individual with master
 
-        for target_param, source_param in zip(replacee.agent.parameters(), master.agent.parameters()):
+        for target_param, source_param in zip(replace.agent.parameters(), master.agent.parameters()):
             target_param.data.copy_(source_param.data)
         # replacee.buffer.reset()
         # replacee.buffer.add_content_of(master.buffer)
@@ -177,27 +200,12 @@ class NN_Evolver:
 
     def fitness_split(self, fitness):
         """
-        将单一的奖励值分解为多个目标
-        :param reward: 总奖励值
-        :param delta_enemy: 对敌方造成的伤害
-        :param delta_deaths: 击杀敌方单位
-        :param delta_ally: 己方单位受到的伤害
-        :return: 分解后的多个目标值
+        multi fitnesses
         """
-        reward = fitness[0]
-        delta_enemy = fitness[1]
-        delta_deaths = fitness[2]
-        delta_ally = fitness[3]
-        # 战斗效能：击杀敌方单位和造成的伤害
-        combat_effectiveness = 0.5 * (delta_enemy + delta_deaths)
-
-        # 生存能力：己方单位受到的伤害（负向指标，越低越好）
-        survivability = 0.3 * -delta_ally  # 负数表示惩罚
-
-        # 团队贡献：综合战斗效能和生存能力的影响
-        team_contribution = 0.2 * reward  # 总奖励值作为团队贡献
-
-        return combat_effectiveness, survivability, team_contribution
+        optimality_fitness = fitness[0]
+        robust_smoothness_fitness = fitness[1]
+        uncertainty_fitness = fitness[2]
+        return optimality_fitness, robust_smoothness_fitness, uncertainty_fitness
 
     def calculate_crowding_distance(self, front, population):
         distances = {i: 0 for i in front}
@@ -215,7 +223,7 @@ class NN_Evolver:
 
         return distances
 
-    def epoch(self, pop, fitness_evals, agent_index, agent_level=False):
+    def epoch(self, pop, fitness_evals, agent_level=False):
         # Entire epoch is handled with indices; Index rank nets by fitness evaluation (0 is the best after reversing)
 
         if self.args.Pareto:
@@ -246,7 +254,7 @@ class NN_Evolver:
                                                tournament_size=3)
 
         # Figure out unselected candidates
-        unselects = [];
+        unselects = []
         new_elitists = []
         for i in range(self.population_size):
             if i not in offsprings and i not in elitist_index:
@@ -272,7 +280,7 @@ class NN_Evolver:
             except:
                 replacee = offsprings.pop(0)
             new_elitists.append(replacee)
-            self.clone(master=pop[i], replacee=pop[replacee], agent_index=agent_index)
+            self.clone(master=pop[i], replace=pop[replacee])
 
         # Crossover between elite and offsprings for the unselected genes with 100 percent probability
 
@@ -281,22 +289,22 @@ class NN_Evolver:
         for i, j in zip(unselects[0::2], unselects[1::2]):
             off_i = random.choice(new_elitists)
             off_j = random.choice(offsprings)
-            self.clone(master=pop[off_i], replacee=pop[i], agent_index=agent_index)
-            self.clone(master=pop[off_j], replacee=pop[j], agent_index=agent_index)
+            self.clone(master=pop[off_i], replace=pop[i])
+            self.clone(master=pop[off_j], replace=pop[j])
 
             if agent_level:
                 if random.random() < 0.5:
-                    self.clone(master=pop[i], replacee=pop[j], agent_index=agent_index)
+                    self.clone(master=pop[i], replace=pop[j])
                 else:
-                    self.clone(master=pop[j], replacee=pop[i], agent_index=agent_index)
+                    self.clone(master=pop[j], replace=pop[i])
             else:
-                self.crossover_inplace(pop[i], pop[j], agent_index)
+                self.crossover_inplace(pop[i], pop[j])
 
         # Mutate all genes in the population except the new elitists
         for i in range(self.population_size):
             if i not in new_elitists:  # Spare the new elitists
                 if random.random() < self.args.mutation_prob:
-                    self.mutate_inplace(pop[i], agent_index=agent_index, agent_level=agent_level)
+                    self.mutate_inplace(pop[i], agent_level=agent_level)
 
         return new_elitists[0]
 
