@@ -4,30 +4,148 @@ import fastrand
 import torch
 from components.episode_buffer import EpisodeBatch
 from controllers import REGISTRY as mac_REGISTRY
+from itertools import chain
 
 def is_lnorm_key(key):
     return key.startswith('lnorm')
 
 class Genome:
+    """
+    Genome class containing two MAC objects for Double Q-learning style estimation.
+    Forward returns min(q1, q2) to prevent Q-value overestimation.
+    """
     def __init__(self, args, buffer, groups):
+        self.n_agents = args.n_agents
+        self.args = args
+        
+        # Create two separate MACs with the same configuration
         self.mac1 = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
         self.mac2 = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+        
+        # Use mac1's action selector as the shared selector
+        self.action_selector = self.mac1.action_selector
+        self.agent_output_type = args.agent_output_type
+        self.save_probs = getattr(self.args, 'save_probs', False)
+    
     def train(self):
+        """Set both agents to training mode."""
         self.mac1.agent.train()
         self.mac2.agent.train()
-    def init_hidden(self):
-        self.mac1.init_hidden()
-        self.mac2.init_hidden()
-    def forward(self, batch: EpisodeBatch, t: int):
-        q1 = self.mac1.forward(batch, t)
-        q2 = self.mac2.forward(batch, t)
+    
+    def init_hidden(self, batch_size):
+        """Initialize hidden states for both MACs."""
+        self.mac1.init_hidden(batch_size)
+        self.mac2.init_hidden(batch_size)
+    
+    def forward(self, ep_batch, t, test_mode=False):
+        """
+        Forward pass through both MACs and return the minimum Q-values.
+        This prevents Q-value overestimation (Double Q-learning style).
+        """
+        q1 = self.mac1.forward(ep_batch, t, test_mode=test_mode)
+        q2 = self.mac2.forward(ep_batch, t, test_mode=test_mode)
+        # Return minimum to prevent overestimation
         return torch.min(q1, q2)
+    
+    def select_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
+        """Select actions using the minimum Q-values from both MACs."""
+        avail_actions = ep_batch["avail_actions"][:, t_ep]
+        agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)
+        chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
+        return chosen_actions
+    
+    def parameters(self):
+        """Return parameters from both MACs."""
+        return chain(self.mac1.parameters(), self.mac2.parameters())
+
+    def load_state(self, other_mac):
+        """Load state from another Genome."""
+        if hasattr(other_mac, 'mac1') and hasattr(other_mac, 'mac2'):
+            # Loading from another Genome
+            self.mac1.load_state(other_mac.mac1)
+            self.mac2.load_state(other_mac.mac2)
+        else:
+            # Loading from a single MAC (copy to both)
+            self.mac1.load_state(other_mac)
+            self.mac2.load_state(other_mac)
+
     def cuda(self):
+        """Move both MACs to CUDA."""
         self.mac1.cuda()
         self.mac2.cuda()
+    
     def save_models(self, path):
+        """Save both MAC models."""
         torch.save(self.mac1.agent.state_dict(), "{}/agent1.th".format(path))
         torch.save(self.mac2.agent.state_dict(), "{}/agent2.th".format(path))
+    
+    def load_models(self, path):
+        """Load both MAC models."""
+        self.mac1.agent.load_state_dict(
+            torch.load("{}/agent1.th".format(path), map_location=lambda storage, loc: storage)
+        )
+        self.mac2.agent.load_state_dict(
+            torch.load("{}/agent2.th".format(path), map_location=lambda storage, loc: storage)
+        )
+
+    def _build_agents(self, input_shape):
+        """Build agents for both MACs."""
+        self.mac1._build_agents(input_shape)
+        self.mac2._build_agents(input_shape)
+
+    def _build_inputs(self, batch, t):
+        """Build inputs for agents (delegates to MAC's method)."""
+        return self.mac1._build_inputs(batch, t)
+
+    def _get_input_shape(self, scheme):
+        """Get input shape for agents (delegates to MAC's method)."""
+        return self.mac1._get_input_shape(scheme)
+    def eval(self):
+        """Set both agents to evaluation mode."""
+        self.mac1.agent.eval()
+        self.mac2.agent.eval()
+    
+    def state_dict(self):
+        """
+        Return combined state dict of both MACs for evolutionary operations.
+        Returns a flat dictionary where keys are prefixed with 'mac1.' or 'mac2.'
+        
+        Important: The returned tensors share storage with the actual parameters,
+        so modifications to the returned tensors will affect the model parameters.
+        This is required for the mutate_inplace() operation in NN_Evolver.
+        """
+        state = {}
+        # Add mac1 parameters with prefix - use named_parameters to get actual parameter tensors
+        for name, param in self.mac1.agent.named_parameters():
+            state[f'mac1.{name}'] = param.data
+        
+        # Add mac2 parameters with prefix
+        for name, param in self.mac2.agent.named_parameters():
+            state[f'mac2.{name}'] = param.data
+        
+        return state
+    
+    def load_state_dict(self, state_dict):
+        """
+        Load state dict into both MACs.
+        Expects keys prefixed with 'mac1.' or 'mac2.'
+        """
+        mac1_state = {}
+        mac2_state = {}
+        
+        for key, value in state_dict.items():
+            if key.startswith('mac1.'):
+                # Remove 'mac1.' prefix
+                mac1_state[key[5:]] = value
+            elif key.startswith('mac2.'):
+                # Remove 'mac2.' prefix
+                mac2_state[key[5:]] = value
+        
+        if mac1_state:
+            self.mac1.agent.load_state_dict(mac1_state)
+        if mac2_state:
+            self.mac2.agent.load_state_dict(mac2_state)
+
 class NN_Evolver:
     def __init__(self, args):
         self.current_gen = 0
@@ -67,7 +185,7 @@ class NN_Evolver:
 
         b_1 = None
         b_2 = None
-        for param1, param2 in zip(gene1.agent.parameters(), gene2.agent.parameters()):
+        for param1, param2 in zip(gene1.parameters(), gene2.parameters()):
             # References to the variable tensors
             W1 = param1.data
             W2 = param2.data
@@ -75,7 +193,7 @@ class NN_Evolver:
                 b_1 = W1
                 b_2 = W2
 
-        for param1, param2 in zip(gene1.agent.parameters(), gene2.agent.parameters()):
+        for param1, param2 in zip(gene1.parameters(), gene2.parameters()):
             # References to the variable tensors
             W1 = param1.data
             W2 = param2.data
@@ -106,9 +224,9 @@ class NN_Evolver:
         super_mut_prob = self.prob_reset_and_sup
         reset_prob = super_mut_prob + self.prob_reset_and_sup
 
-        num_params = len(list(gene.agent.parameters()))
+        num_params = len(list(gene.parameters()))
         ssne_probabilities = np.random.uniform(0, 1, num_params) * 2
-        model_params = gene.agent.state_dict()
+        model_params = gene.state_dict()
 
         for i, key in enumerate(model_params):  # Mutate each param
 
@@ -149,13 +267,13 @@ class NN_Evolver:
 
     def clone(self, master, replace):  # Replace the replacee individual with master
 
-        for target_param, source_param in zip(replace.agent.parameters(), master.agent.parameters()):
+        for target_param, source_param in zip(replace.parameters(), master.parameters()):
             target_param.data.copy_(source_param.data)
         # replacee.buffer.reset()
         # replacee.buffer.add_content_of(master.buffer)
 
     def reset_genome(self, gene):
-        for param in (gene.agent.parameters()):
+        for param in (gene.parameters()):
             param.data.copy_(param.data)
 
     def pareto_dominates(self, individual1, individual2):
@@ -202,10 +320,10 @@ class NN_Evolver:
         """
         multi fitnesses
         """
-        optimality_fitness = fitness[0]
-        robust_smoothness_fitness = fitness[1]
+        env_precise_fitness = fitness[0]
+        confidence_Q_fitness = fitness[1]
         uncertainty_fitness = fitness[2]
-        return optimality_fitness, robust_smoothness_fitness, uncertainty_fitness
+        return env_precise_fitness, confidence_Q_fitness, uncertainty_fitness
 
     def calculate_crowding_distance(self, front, population):
         distances = {i: 0 for i in front}
@@ -306,7 +424,7 @@ class NN_Evolver:
                 if random.random() < self.args.mutation_prob:
                     self.mutate_inplace(pop[i], agent_level=agent_level)
 
-        return new_elitists[0]
+        return new_elitists
 
 
 def unsqueeze(array, axis=1):

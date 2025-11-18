@@ -72,7 +72,7 @@ verbose: False
 EA: True
 Pareto: True
 rl_to_ea_synch_period: 1
-pop_size: 50
+pop_size: 20
 elite_fraction: 0.2 # 0.4 default setting
 mutation_prob: 0.3 # 0.5 default setting
 prob_reset_and_sup: 0.05 # default setting
@@ -85,6 +85,7 @@ N_type: 1 # default setting
 start_timesteps: 1 #10000, 1 for test
 EA_freq : 1  # 50 default setting, 1 for test
 state_alpha: 0.2   # 0.1 beta control VMM, see paper for details
-start_timesteps: 50 # 10000, start to do policy evolution
+rl_replace_ea_synch_period: 1
+
 
 run: "default"

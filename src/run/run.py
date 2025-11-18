@@ -16,7 +16,7 @@ from runners import REGISTRY as r_REGISTRY
 from controllers import REGISTRY as mac_REGISTRY
 from components.episode_buffer import ReplayBuffer
 from components.transforms import OneHot
-from components.Evolver import NN_Evolver
+from components.Evolver import NN_Evolver, Genome
 
 from smac.env import StarCraft2Env
 
@@ -26,9 +26,18 @@ def get_agent_own_state_size(env_args):
     return  4 + sc_env.shield_bits_ally + sc_env.unit_type_bits
 
 
-def rl_to_evo(rl_mac, evo_bad_mac, index):
-    for target_param, param in zip(evo_bad_mac.agent.parameters(), rl_mac.agent.parameters()):
-        alpha = 0.1
+def rl_to_evo(rl_genome, evo_genome):
+    """
+    Transfer parameters from RL Genome to Evolution Genome with exponential moving average.
+    Both Genomes contain two MACs (mac1 and mac2).
+    """
+    alpha = 0.1
+    # Transfer mac1 parameters
+    for target_param, param in zip(evo_genome.mac1.agent.parameters(), rl_genome.mac1.agent.parameters()):
+        target_param.data.copy_(alpha * target_param.data + (1 - alpha) * param.data)
+    
+    # Transfer mac2 parameters
+    for target_param, param in zip(evo_genome.mac2.agent.parameters(), rl_genome.mac2.agent.parameters()):
         target_param.data.copy_(alpha * target_param.data + (1 - alpha) * param.data)
 
 def run(_run, _config, _log):
@@ -155,18 +164,19 @@ def run_sequential(args, logger):
     buffer = ReplayBuffer(scheme, groups, args.buffer_size, env_info["episode_limit"] + 1,
                           preprocess=preprocess,
                           device="cpu" if args.buffer_cpu_only else args.device)
-    # Setup multiagent controller here
-    mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
     
     evolver = NN_Evolver(args)
 
     # Setup populations of multiagent controller here
     if args.EA:
+        # Create main Genome (contains two MACs for double Q-learning)
+        genome = Genome(args, buffer, groups)
+        
+        # Create population of Genomes
         population = []
         fitness = np.zeros((args.pop_size, 3))
         for i in range(args.pop_size):
-            population.append(mac_REGISTRY[args.mac](buffer.scheme, groups, args))
-             # multi-fitness for each agent
+            population.append(Genome(args, buffer, groups))
         pop_size = args.pop_size
         elite_size = args.elite_size 
          
@@ -182,11 +192,14 @@ def run_sequential(args, logger):
     
 
     # Give runner the scheme
-    runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
+    if args.EA:
+        runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=genome)
+    else:
+        runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
 
     # Learner
     if args.EA:
-        learner = le_REGISTRY[args.learner](mac, population, buffer.scheme, logger, args)
+        learner = le_REGISTRY[args.learner](genome, population, buffer.scheme, logger, args)
     else:
         learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
     
@@ -224,7 +237,10 @@ def run_sequential(args, logger):
         runner.t_env = timestep_to_load
 
         if args.evaluate or args.save_replay:
-            evaluate_sequential(mac, args, runner)
+            if args.EA:
+                evaluate_sequential(genome, args, runner)
+            else:
+                evaluate_sequential(mac, args, runner)
             return
 
     # start training
@@ -242,35 +258,22 @@ def run_sequential(args, logger):
         
         # only the best agents in the population interact with the env
         # run with bests of pop
-        if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
-            fitness = [[] for _ in range(args.pop_size)]
+        fitness = [[] for _ in range(args.pop_size)]
+        if args.EA and runner.t_env > args.start_timesteps:
             with th.no_grad():
                 for i in best_agents:
                     episode_batch = runner.run(population[i], test_mode=False)
                     buffer.insert_episode_batch(episode_batch)
-            print('EA starts')
-            for i in range(args.pop_size):
-                # env dynamic fitness (-TD error)
-                env_precise_fitness = learner.calculate_TD_error(episode_batch, i)
-                fitness[i].append(-env_precise_fitness.cpu().numpy())
-                confidence_Q_fitness = learner.calculate_confidence_Q(episode_batch, i)
-                fitness[i].append(confidence_Q_fitness.cpu().numpy())
-                # adv margin fitness
-                robust_smooth_fitness = learner.calculate_adversarial_loss(episode_batch, i)
-                fitness[i].append(-robust_smooth_fitness.cpu().numpy())
-                
-                
-                
-                
-            elite_index = evolver.epoch(population, fitness, agent_level=True)
-            print("EA ends.")
         #  normal run with mac
         else:
+            elite_index = [0]
             fitness = np.zeros((args.pop_size, 3))
-            elite_index = 0
-        
+        # Normal run with mac (or genome if EA)
         with th.no_grad():
-            episode_batch = runner.run(mac, test_mode=False)
+            if args.EA:
+                episode_batch = runner.run(genome, test_mode=False)
+            else:
+                episode_batch = runner.run(mac, test_mode=False)
             buffer.insert_episode_batch(episode_batch)
             
             
@@ -296,7 +299,20 @@ def run_sequential(args, logger):
             learner.train(episode_sample, runner.t_env, episode)
             del episode_sample
             
-
+            if args.EA and runner.t_env > args.start_timesteps:
+                print('EA starts')
+                for i in range(args.pop_size):
+                    # env dynamic fitness (-TD error)
+                    env_precise_fitness = learner.calculate_TD_error(episode_batch, i)
+                    fitness[i].append(-env_precise_fitness.cpu().numpy())
+                    confidence_Q_fitness = learner.calculate_confidence_Q(episode_batch, i)
+                    fitness[i].append(confidence_Q_fitness.cpu().numpy())
+                    # adv margin fitness
+                    robust_smooth_fitness = learner.calculate_adversarial_loss(episode_batch, i)
+                    fitness[i].append(-robust_smooth_fitness.cpu().numpy())
+                elite_index = evolver.epoch(population, fitness, agent_level=True)
+                best_agents = elite_index
+                print("EA ends.")
 
         # Execute test runs once in a while
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
@@ -315,30 +331,30 @@ def run_sequential(args, logger):
             elif (args.test_attack and runner.t_env >= args.t_max // 3 and runner.t_env <= args.t_max // 3 * 2): # attack during the second third of the training
                 runner.set_perturb(True)
             for _ in range(n_test_runs):
-                runner.run(mac, test_mode=True)
+                if args.EA:
+                    runner.run(genome, test_mode=True)
+                else:
+                    runner.run(mac, test_mode=True)
             runner.set_perturb(False)
         
-        
-            if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
-                import copy
-                # Replace any index different from the new elite
+            # Replace any index different from the new elite
+            if args.EA and runner.t_env > args.start_timesteps and episode % args.rl_replace_ea_synch_period == 0:
                 if args.Pareto:
                     fitness = np.array(fitness)
                     replace_index = np.argmin(fitness[:, 0])
                 else:
                     replace_index = np.argmin(fitness)
-                if replace_index == elite_index:
+                if replace_index in elite_index:
                     replace_index = (replace_index + 1) % args.pop_size
-                    while replace_index == elite_index:
+                    while replace_index in elite_index:
                         replace_index = (replace_index + 1) % args.pop_size
-                if replace_index != elite_index:
-                    prev_state = copy.deepcopy(population[replace_index].agent.state_dict())
-                    for index in range(args.n_agents):
-                        rl_to_evo(mac, population[replace_index], index) # replace population[replace_index]'s params with mac's params
+                if replace_index not in elite_index:
+                    # prev_state = copy.deepcopy(population[replace_index].mac1.agent.state_dict())
+                    rl_to_evo(genome, population[replace_index]) # replace population[replace_index]'s params with genome's params
                 # if evaluate_new_population(pop) < evaluate_previous_population(prev_state):
-                #     pop[replace_index].agent.load_state_dict(prev_state)
+                #     pop[replace_index].mac1.agent.load_state_dict(prev_state)
                 evolver.rl_policy = replace_index
-                print('Sync from RL --> Nevo')
+                print('Replace bad individuals with RL')
 
 
         if args.save_model and (runner.t_env - model_save_time >= args.save_model_interval or model_save_time == 0):

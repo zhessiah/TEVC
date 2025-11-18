@@ -16,15 +16,15 @@ from controllers import REGISTRY as mac_REGISTRY
 
 
 class EvoQLearner:
-    def __init__(self, mac, population, scheme, logger, args):
+    def __init__(self, genome, population, scheme, logger, args):
         self.args = args
-        self.mac = mac
+        self.Genome = genome  # Genome contains two MACs (mac1 and mac2)
         self.logger = logger
         self.scheme = scheme  # Save scheme for creating population
         
         self.last_target_update_episode = 0
         self.device = th.device('cuda' if args.use_cuda  else 'cpu')
-        self.params = list(mac.parameters())
+        self.params = list(genome.parameters())  # This includes both mac1 and mac2 parameters
 
         if args.mixer == "qatten":
             self.mixer = QattenMixer(args)
@@ -59,7 +59,7 @@ class EvoQLearner:
             self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
 
         # a little wasteful to deepcopy (e.g. duplicates action selector), but should work for any MAC
-        self.target_mac = copy.deepcopy(mac)
+        self.target_Genome = copy.deepcopy(genome)
         self.log_stats_t = -self.args.learner_log_interval - 1
         self.train_t = 0
 
@@ -97,8 +97,8 @@ class EvoQLearner:
         Returns:
             mean_td_error: Mean TD error for the specified MAC (scalar tensor)
         """
-        # Get the MAC from population
-        pop_mac = self.population[mac_index]
+        # Get the Genome from population (contains mac1 and mac2)
+        pop_genome = self.population[mac_index]
         
         # Get the relevant quantities (same as in train())
         rewards = batch["reward"][:, :-1]
@@ -108,35 +108,49 @@ class EvoQLearner:
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
         
-        # Calculate estimated Q-Values using the population MAC
-        pop_mac.agent.eval()  # Set to eval mode for evaluation
-        mac_out = []
-        pop_mac.init_hidden(batch.batch_size)
+        # Set both agents to eval mode for evaluation
+        pop_genome.mac1.agent.eval()
+        pop_genome.mac2.agent.eval()
         
         with th.no_grad():  # No gradients needed for evaluation
+            # Calculate Q-Values using mac1
+            mac_out_1 = []
+            pop_genome.mac1.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length):
-                agent_outs = pop_mac.forward(batch, t=t)
-                mac_out.append(agent_outs)
+                agent_outs = pop_genome.mac1.forward(batch, t=t)
+                mac_out_1.append(agent_outs)
+            mac_out_1 = th.stack(mac_out_1, dim=1)
+            
+            # Calculate Q-Values using mac2
+            mac_out_2 = []
+            pop_genome.mac2.init_hidden(batch.batch_size)
+            for t in range(batch.max_seq_length):
+                agent_outs = pop_genome.mac2.forward(batch, t=t)
+                mac_out_2.append(agent_outs)
+            mac_out_2 = th.stack(mac_out_2, dim=1)
         
-        mac_out = th.stack(mac_out, dim=1)  # (batch, seq_len, n_agents, n_actions)
-        
-        # Pick the Q-Values for the actions taken by each agent
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
+        # Pick the Q-Values for the actions taken - for both MACs
+        chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions).squeeze(3)
+        chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions).squeeze(3)
         
         # Calculate the Q-Values necessary for the target 
         with th.no_grad():
-            self.target_mac.agent.eval()  # no need to backward
+            self.target_Genome.mac1.agent.eval()
+            self.target_Genome.mac2.agent.eval()
+            
+            # Target Q-values from target_Genome
             target_mac_out = []
-            self.target_mac.init_hidden(batch.batch_size)
+            self.target_Genome.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length):
-                target_agent_outs = self.target_mac.forward(batch, t=t)
+                target_agent_outs = self.target_Genome.forward(batch, t=t)  # min(q1, q2)
                 target_mac_out.append(target_agent_outs)
 
-            # We don't need the first timesteps Q-Value estimate for calculating targets
-            target_mac_out = th.stack(target_mac_out, dim=1)  # Concat across time
+            target_mac_out = th.stack(target_mac_out, dim=1)
 
             # Max over target Q-Values/ Double q learning 
-            mac_out_detach = mac_out.clone().detach()
+            # Use the minimum of mac1 and mac2 for action selection
+            mac_out_combined = th.min(mac_out_1, mac_out_2)
+            mac_out_detach = mac_out_combined.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
@@ -154,19 +168,26 @@ class EvoQLearner:
                 targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
                                                     self.args.n_agents, self.args.gamma, self.args.td_lambda)
 
-        # Mixer 
+        # Mixer - for both MACs
         with th.no_grad():
-            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
+            chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
+            chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
 
-        # Calculate TD error 
-        td_error = (chosen_action_qvals - targets.detach())
-        td_error2 = 0.5 * td_error.pow(2)
+        # Calculate TD error for both MACs and sum them
+        td_error_1 = (chosen_action_qvals_1 - targets.detach())
+        td_error2_1 = 0.5 * td_error_1.pow(2)
+        
+        td_error_2 = (chosen_action_qvals_2 - targets.detach())
+        td_error2_2 = 0.5 * td_error_2.pow(2)
 
-        mask = mask.expand_as(td_error2)
-        masked_td_error = td_error2 * mask
+        mask_expanded = mask.expand_as(td_error2_1)
+        masked_td_error_1 = td_error2_1 * mask_expanded
+        masked_td_error_2 = td_error2_2 * mask_expanded
 
-        # Calculate mean TD error 
-        mean_td_error = masked_td_error.sum() / mask.sum()
+        # Sum TD errors from both MACs
+        mean_td_error_1 = masked_td_error_1.sum() / mask_expanded.sum()
+        mean_td_error_2 = masked_td_error_2.sum() / mask_expanded.sum()
+        mean_td_error = mean_td_error_1 + mean_td_error_2
         
         return mean_td_error
 
@@ -195,7 +216,7 @@ class EvoQLearner:
         avail_actions = batch["avail_actions"]
         
         # Calculate estimated Q-Values using the population MAC
-        pop_mac.agent.eval()  # Set to eval mode for evaluation
+        pop_mac.eval()  # Set to eval mode for evaluation
         mac_out = []
         pop_mac.init_hidden(batch.batch_size)
         
@@ -206,13 +227,10 @@ class EvoQLearner:
         
         mac_out = th.stack(mac_out, dim=1)  # (batch, seq_len, n_agents, n_actions)
         
-        # Compute confidence Q metric here (implementation depends on definition)
-        # Placeholder implementation:
-        confidence_Q_values = th.std(mac_out, dim=-1)  # Example: standard deviation across actions
-        
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
         # Calculate mean confidence Q 
-        mean_confidence_Q = (confidence_Q_values * mask).sum() / mask.sum()
-        
+        mean_confidence_Q = (chosen_action_qvals * mask).sum() / mask.sum()
+
         return mean_confidence_Q
 
 
@@ -228,28 +246,29 @@ class EvoQLearner:
         Returns:
             adv_loss: Mean adversarial loss for the specified MAC (scalar tensor)
         """
-        # Get the MAC from population
-        pop_mac = self.population[mac_index]
+        # Get the Genome from population
+        pop_genome = self.population[mac_index]
         
         # Get the relevant quantities for robust regularizer (same as in train())
         adv_terminated = batch["terminated"].float()
         adv_mask = batch["filled"].float()
         adv_mask[:, 1:] = adv_mask[:, 1:] * (1 - adv_terminated[:, :-1])
         
-        # Calculate estimated Q-Values using the population MAC
-        pop_mac.agent.eval()  # Set to eval mode for evaluation
-        mac_out = []
+        # Set both agents to eval mode for evaluation
+        pop_genome.mac1.agent.eval()
+        pop_genome.mac2.agent.eval()
+        
         adv_margin = []
-        pop_mac.init_hidden(batch.batch_size)
+        pop_genome.init_hidden(batch.batch_size)
         
         with th.no_grad():  # No gradients needed for evaluation
             for t in range(batch.max_seq_length):
-                agent_outs = pop_mac.forward(batch, t=t)  # normal Q-values
-                mac_out.append(agent_outs)
+                # Normal Q-values from Genome (min of two MACs)
+                agent_outs = pop_genome.forward(batch, t=t)
                 
                 # Calculate adversarial margin
                 adv_batch = noise_atk(batch, self.args)
-                adv_agent_out = pop_mac.forward(adv_batch, t=t)
+                adv_agent_out = pop_genome.forward(adv_batch, t=t)
                 adv_margin.append(get_max_diff(agent_outs, adv_agent_out))
         
         # Calculate adversarial loss (EXACTLY as in train())
@@ -281,42 +300,57 @@ class EvoQLearner:
         adv_mask[:, 1:] = adv_mask[:, 1:] * (1 - adv_terminated[:, :-1])
         
         
-        # Calculate estimated Q-Values
-        self.mac.agent.train() # train mode
-        mac_out = []
-        adv_margin = []
-        self.mac.init_hidden(batch.batch_size)
+        # Calculate estimated Q-Values for BOTH MACs in Genome
+        self.Genome.train()  # Set both mac1 and mac2 to train mode
         
-                
+        # Forward pass for mac1
+        mac_out_1 = []
+        adv_margin = []
+        self.Genome.mac1.init_hidden(batch.batch_size)
+        
         for t in range(batch.max_seq_length):
-            agent_outs = self.mac.forward(batch, t=t) # normal Q-values
-            mac_out.append(agent_outs)
+            agent_outs_1 = self.Genome.mac1.forward(batch, t=t)
+            mac_out_1.append(agent_outs_1)
             
-        # if t_env >= self.args.t_max // 4:        
-            if self.args.diff_regular or self.args.pareto:
+        # Forward pass for mac2
+        mac_out_2 = []
+        self.Genome.mac2.init_hidden(batch.batch_size)
+        
+        for t in range(batch.max_seq_length):
+            agent_outs_2 = self.Genome.mac2.forward(batch, t=t)
+            mac_out_2.append(agent_outs_2)
+            
+        # Calculate adversarial margin using min(q1, q2)
+        if self.args.diff_regular or self.args.pareto:
+            self.Genome.init_hidden(batch.batch_size)
+            for t in range(batch.max_seq_length):
+                agent_outs = self.Genome.forward(batch, t=t)  # min(q1, q2)
                 adv_batch = noise_atk(batch, self.args)
-                adv_agent_out = self.mac.forward(adv_batch, t=t)    
+                adv_agent_out = self.Genome.forward(adv_batch, t=t)    
                 adv_margin.append(get_max_diff(agent_outs, adv_agent_out))
                 
-        mac_out = th.stack(mac_out, dim=1)  # Concat over time. (batch, seq_len, n_agents, n_actions)
-        # Pick the Q-Values for the actions taken by each agent
-        # (batch, seq_len - 1, n_agents)
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)  # Remove the last dim
+        mac_out_1 = th.stack(mac_out_1, dim=1)  # (batch, seq_len, n_agents, n_actions)
+        mac_out_2 = th.stack(mac_out_2, dim=1)  # (batch, seq_len, n_agents, n_actions)
+        
+        # Pick the Q-Values for the actions taken by each agent - for both MACs
+        chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions).squeeze(3)
+        chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions).squeeze(3)
 
         # Calculate the Q-Values necessary for the target
         with th.no_grad():
-            self.target_mac.agent.train()
+            self.target_Genome.train()  # Set target Genome to train mode
             target_mac_out = []
-            self.target_mac.init_hidden(batch.batch_size)
+            self.target_Genome.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length):
-                target_agent_outs = self.target_mac.forward(batch, t=t)
+                target_agent_outs = self.target_Genome.forward(batch, t=t)  # min(q1, q2)
                 target_mac_out.append(target_agent_outs)
 
-            # We don't need the first timesteps Q-Value estimate for calculating targets
             target_mac_out = th.stack(target_mac_out, dim=1)  # Concat across time
 
             # Max over target Q-Values/ Double q learning
-            mac_out_detach = mac_out.clone().detach()
+            # Use min(mac1, mac2) for action selection
+            mac_out_combined = th.min(mac_out_1, mac_out_2)
+            mac_out_detach = mac_out_combined.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
@@ -334,26 +368,32 @@ class EvoQLearner:
                 targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
                                                     self.args.n_agents, self.args.gamma, self.args.td_lambda)
 
-        # Mixer
-        # (batch, seq_len - 1, num_agents) -> (batch, seq_len - 1, 1)
-        # change individual q-values to joint q-values
-        chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
+        # Mixer - for both MACs
+        chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
+        chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
 
-        td_error = (chosen_action_qvals - targets.detach())
-        td_error2 = 0.5 * td_error.pow(2) # (batch, seq_len - 1, 1)
+        # Calculate TD error for BOTH MACs
+        td_error_1 = (chosen_action_qvals_1 - targets.detach())
+        td_error2_1 = 0.5 * td_error_1.pow(2)
+        
+        td_error_2 = (chosen_action_qvals_2 - targets.detach())
+        td_error2_2 = 0.5 * td_error_2.pow(2)
 
-        mask = mask.expand_as(td_error2) # (batch, seq_len - 1, 1)
-        masked_td_error = td_error2 * mask # (batch, seq_len - 1, 1)
-
+        mask = mask.expand_as(td_error2_1)
+        masked_td_error_1 = td_error2_1 * mask
+        masked_td_error_2 = td_error2_2 * mask
 
         # important sampling for PER
         if self.use_per:
             per_weight = th.from_numpy(per_weight).unsqueeze(-1).to(device=self.device)
-            masked_td_error = masked_td_error.sum(1) * per_weight
+            masked_td_error_1 = masked_td_error_1.sum(1) * per_weight
+            masked_td_error_2 = masked_td_error_2.sum(1) * per_weight
 
-
-        # TODO: here need to add robust term
-        loss = L_td = masked_td_error.sum() / mask.sum()
+        # Sum TD errors from both MACs - this is the key change!
+        L_td_1 = masked_td_error_1.sum() / mask.sum()
+        L_td_2 = masked_td_error_2.sum() / mask.sum()
+        L_td = L_td_1 + L_td_2  # Total loss is sum of both MACs
+        loss = L_td
         
 
     # if t_env >= self.args.t_max // 4:        
@@ -444,27 +484,21 @@ class EvoQLearner:
             self.logger.log_stat("loss_td", L_td.item(), t_env)
             self.logger.log_stat("grad_norm", grad_norm, t_env)
             mask_elems = mask.sum().item()
-            self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
-            self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
+            # Use combined masked_td_error for logging
+            masked_td_error_combined = masked_td_error_1 + masked_td_error_2
+            self.logger.log_stat("td_error_abs", (masked_td_error_combined.abs().sum().item()/mask_elems), t_env)
+            # Use average of both MACs for q_taken_mean
+            chosen_action_qvals_avg = (chosen_action_qvals_1 + chosen_action_qvals_2) / 2.0
+            self.logger.log_stat("q_taken_mean", (chosen_action_qvals_avg * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
-            
-            if self.args.robust_regular or self.args.diff_regular: 
-                self.logger.log_stat("adv_margin", adv_margin.mean().item(), t_env)
-                self.logger.log_stat("loss", loss.item(), t_env)
-                if self.args.weight_td:
-                    self.logger.log_stat("log_var_a", self.log_var_a.item(), t_env)
-                    self.logger.log_stat("log_var_b", self.log_var_b.item(), t_env)
-                elif self.args.weight_adv_loss:
-                    self.logger.log_stat("log_var_b", self.log_var_b.item(), t_env)
-                elif self.args.pareto:
-                    self.logger.log_stat("td_weight", scale['td'], t_env)
-                    self.logger.log_stat("adv_weight", scale['adv'], t_env)
             
             self.log_stats_t = t_env
             
             # print estimated matrix
             if self.args.env == "one_step_matrix_game":
-                print_matrix_status(batch, self.mixer, mac_out)
+                # Use combined mac_out for matrix status
+                mac_out_combined = th.min(mac_out_1, mac_out_2)
+                print_matrix_status(batch, self.mixer, mac_out_combined)
 
         # return info
         info = {}
@@ -478,161 +512,37 @@ class EvoQLearner:
                 info["td_errors_abs"] = (info["td_errors_abs"] - self.priority_min) \
                                 / (self.priority_max - self.priority_min + 1e-5)
             else:
-                info["td_errors_abs"] = ((td_error.abs() * mask).sum(1) \
+                # Use combined td_error from both MACs
+                td_error_combined = td_error_1 + td_error_2
+                info["td_errors_abs"] = ((td_error_combined.abs() * mask).sum(1) \
                                 / th.sqrt(mask.sum(1))).detach().to('cpu')
         return info
 
     def _update_targets(self):
-        self.target_mac.load_state(self.mac)
+        self.target_Genome.load_state(self.Genome)
         if self.mixer is not None:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
         self.logger.console_logger.info("Updated target network")
 
     def cuda(self):
-        self.mac.cuda()
-        self.target_mac.cuda()
-        for pop_mac in self.population:
-            pop_mac.cuda()
+        self.Genome.cuda()
+        self.target_Genome.cuda()
+        for pop_genome in self.population:
+            pop_genome.cuda()
         if self.mixer is not None:
             self.mixer.cuda()
             self.target_mixer.cuda()
             
     def save_models(self, path):
-        self.mac.save_models(path)
+        self.Genome.save_models(path)
         if self.mixer is not None:
             th.save(self.mixer.state_dict(), "{}/mixer.th".format(path))
         th.save(self.optimiser.state_dict(), "{}/opt.th".format(path))
 
     def load_models(self, path):
-        self.mac.load_models(path)
+        self.Genome.load_models(path)
         # Not quite right but I don't want to save target networks
-        self.target_mac.load_models(path)
+        self.target_Genome.load_models(path)
         if self.mixer is not None:
             self.mixer.load_state_dict(th.load("{}/mixer.th".format(path), map_location=lambda storage, loc: storage))
         self.optimiser.load_state_dict(th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage))
-
-
-    def compute_td_and_adv(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
-       # Get the relevant quantities
-        rewards = batch["reward"][:, :-1] # the total reward
-        actions = batch["actions"][:, :-1]
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["filled"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1]) # whether the sample is valid
-        avail_actions = batch["avail_actions"]
-        
-        # just for robust regularizer
-        adv_terminated = batch["terminated"].float()
-        adv_mask = batch["filled"].float()
-        adv_mask[:, 1:] = adv_mask[:, 1:] * (1 - adv_terminated[:, :-1])
-        
-        
-        # Calculate estimated Q-Values
-        self.mac.agent.train() # train mode
-        mac_out = []
-        self.mac.init_hidden(batch.batch_size)
-        adv_margin = []
-
-                
-        for t in range(batch.max_seq_length):
-            agent_outs = self.mac.forward(batch, t=t) # normal Q-values
-            mac_out.append(agent_outs)
-            
-            
-            if self.args.robust_regular: 
-                envs_not_terminated = [i for i in range(batch.batch_size) if adv_mask[i][t]]
-                adv_batch = attack(self.mac, batch, self.args, t, bs=envs_not_terminated)
-                with th.no_grad():
-                    adv_agent_out = self.mac.forward(adv_batch, t=t) # (batch, n_agents, n_actions) adv Q-values
-                label = th.argmax(agent_outs, dim=2).clone().detach() # (batch, n_agents)
-                adv_margin.append(logits_margin(adv_agent_out[envs_not_terminated], label[envs_not_terminated], avail_actions[envs_not_terminated][:, t]))
-            
-            else:
-                adv_batch = noise_atk(batch, self.args)
-                adv_agent_out = self.mac.forward(adv_batch, t=t)    
-                adv_margin.append(get_max_diff(agent_outs, adv_agent_out))
-                
-        mac_out = th.stack(mac_out, dim=1)  # Concat over time. (batch, seq_len, n_agents, n_actions)
-        # Pick the Q-Values for the actions taken by each agent
-        # (batch, seq_len - 1, n_agents)
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)  # Remove the last dim
-
-        # Calculate the Q-Values necessary for the target
-        with th.no_grad():
-            self.target_mac.agent.train()
-            target_mac_out = []
-            self.target_mac.init_hidden(batch.batch_size)
-            for t in range(batch.max_seq_length):
-                target_agent_outs = self.target_mac.forward(batch, t=t)
-                target_mac_out.append(target_agent_outs)
-
-            # We don't need the first timesteps Q-Value estimate for calculating targets
-            target_mac_out = th.stack(target_mac_out, dim=1)  # Concat across time
-
-            # Max over target Q-Values/ Double q learning
-            mac_out_detach = mac_out.clone().detach()
-            mac_out_detach[avail_actions == 0] = -9999999
-            cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
-            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
-            
-            # Calculate n-step Q-Learning targets
-            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"]) # (batch, seq_len, 1)
-
-            if getattr(self.args, 'q_lambda', False):
-                qvals = th.gather(target_mac_out, 3, batch["actions"]).squeeze(3)
-                qvals = self.target_mixer(qvals, batch["state"])
-
-                targets = build_q_lambda_targets(rewards, terminated, mask, target_max_qvals, qvals,
-                                    self.args.gamma, self.args.td_lambda)
-            else: # (batch, seq_len - 1, n_agents) the last timestep is removed
-                targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
-                                                    self.args.n_agents, self.args.gamma, self.args.td_lambda)
-
-        # Mixer
-        # (batch, seq_len - 1, num_agents) -> (batch, seq_len - 1, 1)
-        # change individual q-values to joint q-values
-        chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
-
-        td_error = (chosen_action_qvals - targets.detach())
-        td_error2 = 0.5 * td_error.pow(2) # (batch, seq_len - 1, 1)
-
-        mask = mask.expand_as(td_error2) # (batch, seq_len - 1, 1)
-        masked_td_error = td_error2 * mask # (batch, seq_len - 1, 1)
-
-
-        # important sampling for PER
-        if self.use_per:
-            per_weight = th.from_numpy(per_weight).unsqueeze(-1).to(device=self.device)
-            masked_td_error = masked_td_error.sum(1) * per_weight
-
-
-        # TODO: here need to add robust term
-        loss = masked_td_error.sum() / mask.sum()
-        
-        adv_margin = th.stack(adv_margin, dim=0).transpose(0, 1) * adv_mask.squeeze(2) # (batch, seq_len)
-        adv_loss = adv_margin.sum() / adv_mask.sum()
-        
-        return loss, adv_loss
-    
-    # def compute_adv(self, batch: EpisodeBatch, t_env: int, episode_num: int, agent_outs, per_weight=None):
-    #     # Get the relevant quantities
-    #     rewards = batch["reward"][:, :-1] # the total reward
-    #     actions = batch["actions"][:, :-1]
-    #     terminated = batch["terminated"][:, :-1].float()
-    #     mask = batch["filled"][:, :-1].float()
-    #     mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1]) # whether the sample is valid
-    #     avail_actions = batch["avail_actions"]
-        
-    #     # just for robust regularizer
-    #     adv_terminated = batch["terminated"].float()
-    #     adv_mask = batch["filled"].float()
-    #     adv_mask[:, 1:] = adv_mask[:, 1:] * (1 - adv_terminated[:, :-1])
-        
-    #     for t in range(batch.max_seq_length):
-
-        
-        
-        
-        
-    #     adv_margin = th.stack(adv_margin, dim=0).transpose(0, 1) * adv_mask.squeeze(2) # (batch, seq_len)
-    #     adv_loss = adv_margin.sum() / adv_mask.sum()
