@@ -301,6 +301,8 @@ def run_sequential(args, logger):
             
             if args.EA and runner.t_env > args.start_timesteps:
                 print('EA starts')
+                # Reset fitness to list of lists for append operations
+                fitness = [[] for _ in range(args.pop_size)]
                 for i in range(args.pop_size):
                     # env dynamic fitness (-TD error)
                     env_precise_fitness = learner.calculate_TD_error(episode_batch, i)

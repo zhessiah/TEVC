@@ -229,6 +229,8 @@ class EvoQLearner:
         
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
         # Calculate mean confidence Q 
+        with th.no_grad():
+            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
         mean_confidence_Q = (chosen_action_qvals * mask).sum() / mask.sum()
 
         return mean_confidence_Q
@@ -305,7 +307,6 @@ class EvoQLearner:
         
         # Forward pass for mac1
         mac_out_1 = []
-        adv_margin = []
         self.Genome.mac1.init_hidden(batch.batch_size)
         
         for t in range(batch.max_seq_length):
@@ -320,15 +321,6 @@ class EvoQLearner:
             agent_outs_2 = self.Genome.mac2.forward(batch, t=t)
             mac_out_2.append(agent_outs_2)
             
-        # Calculate adversarial margin using min(q1, q2)
-        if self.args.diff_regular or self.args.pareto:
-            self.Genome.init_hidden(batch.batch_size)
-            for t in range(batch.max_seq_length):
-                agent_outs = self.Genome.forward(batch, t=t)  # min(q1, q2)
-                adv_batch = noise_atk(batch, self.args)
-                adv_agent_out = self.Genome.forward(adv_batch, t=t)    
-                adv_margin.append(get_max_diff(agent_outs, adv_agent_out))
-                
         mac_out_1 = th.stack(mac_out_1, dim=1)  # (batch, seq_len, n_agents, n_actions)
         mac_out_2 = th.stack(mac_out_2, dim=1)  # (batch, seq_len, n_agents, n_actions)
         
@@ -395,81 +387,6 @@ class EvoQLearner:
         L_td = L_td_1 + L_td_2  # Total loss is sum of both MACs
         loss = L_td
         
-
-    # if t_env >= self.args.t_max // 4:        
-        
-        if self.args.robust_regular or self.args.diff_regular or self.args.pareto: 
-            
-            adv_margin = th.stack(adv_margin, dim=0).transpose(0, 1) * adv_mask.squeeze(2) # (batch, seq_len)
-            adv_loss = adv_margin.sum() / adv_mask.sum()
-            if self.args.weight_td:
-                loss = th.exp(-self.log_var_a) * loss + self.log_var_a
-                loss += (adv_loss * th.exp(-self.log_var_b) + self.log_var_b)
-            elif self.args.weight_adv_loss:
-                loss = loss + adv_loss * (-self.log_var_b) + (float(self.args.robust_lambda) / self.log_var_b)
-            elif self.args.pareto:
-                
-                # lossa = masked_td_error
-                # lossb = adv_margin[:, :-1].unsqueeze(2)
-                # if th.matmul(lossa.transpose(1,2), lossb).sum() >= th.matmul(lossa.transpose(1,2), lossa).sum():
-                #     gamma = 1
-                # elif th.matmul(lossa.transpose(1,2), lossb).sum() >= th.matmul(lossb.transpose(1,2), lossb).sum():
-                #     gamma = 0
-                # else:
-                #     gamma = th.matmul((lossb - lossa).transpose(1,2), lossb).mean() / th.norm(lossa - lossb, p=2) ** 2
-                # lossa = lossa.sum() / mask.sum()
-                # lossb = lossb.sum() / adv_mask.sum()
-                # loss = gamma * lossa + (1 - gamma) * lossb
-                
-                # compute grad of td
-                loss_data = {}
-                grads = {}
-                scale = {}
-                tasks = ['td', 'adv']
-                loss_data['td'] = loss.data
-                loss_data['adv'] = adv_loss.data
-                self.optimiser.zero_grad()
-                loss.backward(retain_graph=True)
-                grads['td'] = []
-                for p in self.params:
-                    if p.grad is not None:
-                        grads['td'].append(Variable(p.grad.data.clone(), requires_grad=False))
-                    
-                # compute grad of adv    
-                self.optimiser.zero_grad()
-                adv_loss.backward()
-                grads['adv'] = []
-                for p in self.params:
-                    if p.grad is not None:
-                        grads['adv'].append(Variable(p.grad.data.clone(), requires_grad=False))
-                        
-                        
-                # normalize
-                gn = gradient_normalizers(grads, loss_data, self.args.normalization_type)
-                for t in tasks:
-                    for gr_i in range(len(grads[t])):
-                        grads[t][gr_i] = grads[t][gr_i] / gn[t]
-                        
-                # use F-W algorithm to compute pareto optimal
-                sol, _ = MinNormSolver.find_min_norm_element([grads[t] for t in tasks])
-                for i, t in enumerate(tasks):
-                    scale[t] = float(sol[i])
-                    
-                    
-                self.optimiser.zero_grad()
-                
-                td_loss, adv_loss = self.compute_td_and_adv(batch, t_env, episode_num, per_weight) 
-                
-                # scale['adv'] = min(0.01, scale['adv'])
-                # scale['td'] = 1 - scale['adv']
-                                    
-                loss = scale['td'] * td_loss + scale['adv'] * adv_loss
-                        
-            else: # fixed lambda
-                loss += adv_loss * float(self.args.robust_lambda)
-            
-                
-
         # Optimise
         self.optimiser.zero_grad()
         loss.backward()
