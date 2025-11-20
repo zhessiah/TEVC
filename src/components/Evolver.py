@@ -360,12 +360,20 @@ class NN_Evolver:
                 # sorted_front = sorted(front, key=lambda i: crowding_distances[i], reverse=True)
                 # selected.extend(sorted_front[:len(pop) // len(pareto_fronts)])  # Select individuals from each front
                 index_rank.extend(front)
-            # Elitism: Keep the best individuals
+            # Elitism: Keep the best individuals (from the first front)
             elitist_index = index_rank[:self.num_elitists]
+            
+            # Worst individuals: from the last non-empty Pareto front
+            worst_index = []
+            for front in reversed(pareto_fronts):
+                if len(front) > 0:  # Find the last non-empty front
+                    worst_index = front[:self.num_elitists] if len(front) >= self.num_elitists else front
+                    break
         else:
             index_rank = np.argsort(fitness_evals)[::-1]
 
             elitist_index = index_rank[:self.num_elitists]  # Elitist indexes safeguard
+            worst_index = index_rank[-self.num_elitists:]  # Worst individuals
 
         # Selection step
         offsprings = self.selection_tournament(index_rank, num_offsprings=len(index_rank) - self.num_elitists,
@@ -380,16 +388,16 @@ class NN_Evolver:
         random.shuffle(unselects)
 
         # COMPUTE RL_SELECTION RATE
-        if self.rl_policy is not None:  # RL Transfer happened
-            self.selection_stats['total'] += 1.0
+        # if self.rl_policy is not None:  # RL Transfer happened
+        #     self.selection_stats['total'] += 1.0
 
-            if self.rl_policy in elitist_index:
-                self.selection_stats['elite'] += 1.0
-            elif self.rl_policy in offsprings:
-                self.selection_stats['selected'] += 1.0
-            elif self.rl_policy in unselects:
-                self.selection_stats['discarded'] += 1.0
-            self.rl_policy = None
+        #     if self.rl_policy in elitist_index:
+        #         self.selection_stats['elite'] += 1.0
+        #     elif self.rl_policy in offsprings:
+        #         self.selection_stats['selected'] += 1.0
+        #     elif self.rl_policy in unselects:
+        #         self.selection_stats['discarded'] += 1.0
+        #     self.rl_policy = None
 
         # Elitism step, assigning elite candidates to some unselects
         for i in elitist_index:
@@ -424,7 +432,7 @@ class NN_Evolver:
                 if random.random() < self.args.mutation_prob:
                     self.mutate_inplace(pop[i], agent_level=agent_level)
 
-        return new_elitists
+        return new_elitists, worst_index
 
 
 def unsqueeze(array, axis=1):

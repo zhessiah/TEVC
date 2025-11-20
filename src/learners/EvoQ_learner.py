@@ -10,8 +10,8 @@ from torch.optim import RMSprop, Adam
 import numpy as np
 from utils.th_utils import get_parameters_num
 from utils.attack_util import logits_margin, attack, get_diff, noise_atk, get_max_diff
-from torch.autograd import Variable
-from utils.pareto import MinNormSolver, gradient_normalizers
+# from torch.autograd import Variable
+# from utils.pareto import MinNormSolver, gradient_normalizers
 from controllers import REGISTRY as mac_REGISTRY
 
 

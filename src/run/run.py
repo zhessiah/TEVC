@@ -63,6 +63,8 @@ def run(_run, _config, _log):
     if args.use_tensorboard:
         tb_logs_direc = os.path.join(dirname(dirname(dirname(abspath(__file__)))), "results", "tb_logs")
         
+        if args.EA:
+            tb_logs_direc = os.path.join(tb_logs_direc, "EA")
         if args.training_attack:
             tb_logs_direc = os.path.join(tb_logs_direc, "train_attack")
         elif args.test_attack:
@@ -71,6 +73,7 @@ def run(_run, _config, _log):
             tb_logs_direc = os.path.join(tb_logs_direc, "all_test_attack")
         else:
             tb_logs_direc = os.path.join(tb_logs_direc, "no_attack")
+        
         
         if "sc2" in args.env or "gfootball" in args.env:
             tb_logs_direc = os.path.join(tb_logs_direc, args.env_args["map_name"])
@@ -174,7 +177,7 @@ def run_sequential(args, logger):
         
         # Create population of Genomes
         population = []
-        fitness = np.zeros((args.pop_size, 3))
+        # fitness = np.zeros((args.pop_size, 3))
         for i in range(args.pop_size):
             population.append(Genome(args, buffer, groups))
         pop_size = args.pop_size
@@ -258,16 +261,18 @@ def run_sequential(args, logger):
         
         # only the best agents in the population interact with the env
         # run with bests of pop
-        fitness = [[] for _ in range(args.pop_size)]
+        # fitness = [[] for _ in range(args.pop_size)]
+        replace_index = None
         if args.EA and runner.t_env > args.start_timesteps:
+            
             with th.no_grad():
                 for i in best_agents:
                     episode_batch = runner.run(population[i], test_mode=False)
                     buffer.insert_episode_batch(episode_batch)
         #  normal run with mac
-        else:
-            elite_index = [0]
-            fitness = np.zeros((args.pop_size, 3))
+        # else:
+        #     elite_index = [0]
+        #     fitness = np.zeros((args.pop_size, 3))
         # Normal run with mac (or genome if EA)
         with th.no_grad():
             if args.EA:
@@ -299,8 +304,9 @@ def run_sequential(args, logger):
             learner.train(episode_sample, runner.t_env, episode)
             del episode_sample
             
+            # NSGA begins here
             if args.EA and runner.t_env > args.start_timesteps:
-                print('EA starts')
+                # print('EA starts')
                 # Reset fitness to list of lists for append operations
                 fitness = [[] for _ in range(args.pop_size)]
                 for i in range(args.pop_size):
@@ -312,11 +318,28 @@ def run_sequential(args, logger):
                     # adv margin fitness
                     robust_smooth_fitness = learner.calculate_adversarial_loss(episode_batch, i)
                     fitness[i].append(-robust_smooth_fitness.cpu().numpy())
-                elite_index = evolver.epoch(population, fitness, agent_level=True)
+                elite_index, replace_index = evolver.epoch(population, fitness, agent_level=True)
                 best_agents = elite_index
-                print("EA ends.")
+                # print("EA ends.")
 
         # Execute test runs once in a while
+        
+        if args.EA and runner.t_env > args.start_timesteps:
+            # if args.Pareto:
+            #     fitness = np.array(fitness)
+            #     replace_index = np.argmin(fitness[:, 0]) # replace worst reward
+            # else:
+            #     replace_index = np.argmin(fitness)
+            if replace_index is not None:
+                for i in replace_index:
+                    # prev_state = copy.deepcopy(population[replace_index].mac1.agent.state_dict())
+                    rl_to_evo(genome, population[i]) # replace population[replace_index]'s params with genome's params
+            # if evaluate_new_population(pop) < evaluate_previous_population(prev_state):
+            #     pop[replace_index].mac1.agent.load_state_dict(prev_state)
+            evolver.rl_policy = replace_index
+            # print('Replace bad individuals with RL')
+        
+        
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
         if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
 
@@ -339,24 +362,8 @@ def run_sequential(args, logger):
                     runner.run(mac, test_mode=True)
             runner.set_perturb(False)
         
-            # Replace any index different from the new elite
-            if args.EA and runner.t_env > args.start_timesteps and episode % args.rl_replace_ea_synch_period == 0:
-                if args.Pareto:
-                    fitness = np.array(fitness)
-                    replace_index = np.argmin(fitness[:, 0])
-                else:
-                    replace_index = np.argmin(fitness)
-                if replace_index in elite_index:
-                    replace_index = (replace_index + 1) % args.pop_size
-                    while replace_index in elite_index:
-                        replace_index = (replace_index + 1) % args.pop_size
-                if replace_index not in elite_index:
-                    # prev_state = copy.deepcopy(population[replace_index].mac1.agent.state_dict())
-                    rl_to_evo(genome, population[replace_index]) # replace population[replace_index]'s params with genome's params
-                # if evaluate_new_population(pop) < evaluate_previous_population(prev_state):
-                #     pop[replace_index].mac1.agent.load_state_dict(prev_state)
-                evolver.rl_policy = replace_index
-                print('Replace bad individuals with RL')
+            # Replace bad individuals with mac
+        
 
 
         if args.save_model and (runner.t_env - model_save_time >= args.save_model_interval or model_save_time == 0):
