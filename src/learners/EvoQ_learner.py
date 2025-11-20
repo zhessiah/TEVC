@@ -280,23 +280,18 @@ class EvoQLearner:
                 adv_global_q.append(adv_agent_out)
         
         # Stack and take mean over the last dimension (n_actions), then remove it
-        normal_global_q = th.stack(normal_global_q, dim=1).mean(dim=-1)  # (batch, seq_len, n_agents)
-        adv_global_q = th.stack(adv_global_q, dim=1).mean(dim=-1)  # (batch, seq_len, n_agents)
-        
+        normal_global_q = th.stack(normal_global_q, dim=1)  # (batch, seq_len, n_agents, num_actions)
+        adv_global_q = th.stack(adv_global_q, dim=1) # (batch, seq_len, n_agents, num_actions)
+
         # Apply mixer to get Global Q
         with th.no_grad():
-            normal_global_q = self.mixer(normal_global_q, batch["state"])  # (batch, seq_len, 1)
-            adv_global_q = self.mixer(adv_global_q, adv_batch["state"])  # (batch, seq_len, 1)
+            normal_global_q = self.mixer(normal_global_q, batch["state"])[:, :-1] * mask # (batch, seq_len, 1)
+            adv_global_q = self.mixer(adv_global_q, adv_batch["state"])[:, :-1] * mask # (batch, seq_len, 1)
                 
         
         # Calculate the difference in Global Q-values
-        global_q_diff = th.abs(normal_global_q - adv_global_q).squeeze(2)  # (batch, seq_len-1)
-        
-        # Mask and average
-        masked_diff = global_q_diff[:, :-1] * mask.squeeze(2)
-        adv_loss = masked_diff.sum() / mask.sum()
-        
-        return adv_loss
+        return get_diff(normal_global_q, adv_global_q).mean()
+
         
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
         # Get the relevant quantities

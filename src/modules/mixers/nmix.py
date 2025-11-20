@@ -36,6 +36,45 @@ class Mixer(nn.Module):
                 orthogonal_init_(m)
 
     def forward(self, qvals, states):
+        # Handle both 3D (batch, t, n_agents) and 4D (batch, t, n_agents, n_actions) inputs
+        original_shape = qvals.shape
+        
+        if len(original_shape) == 4:
+            # 4D input: (batch, t, n_agents, n_actions)
+            # Need to process each action's Q-values separately
+            b, t, n_agents, n_actions = original_shape
+            
+            # Reshape to (batch, t, n_agents * n_actions) to process all at once
+            # Then reshape back after mixing
+            qvals_reshaped = qvals.view(b, t, n_agents, n_actions)
+            
+            # Process each action dimension separately and stack results
+            mixed_outputs = []
+            for a in range(n_actions):
+                # Extract Q-values for this action across all agents
+                qvals_action = qvals_reshaped[:, :, :, a]  # (batch, t, n_agents)
+                
+                # Mix this action's Q-values
+                mixed_q = self._mix_qvals(qvals_action, states)  # (batch, t, 1), mix all agents' local q to a global q
+                mixed_outputs.append(mixed_q)
+            
+            # Stack along action dimension: (batch, t, n_actions)
+            result = th.stack(mixed_outputs, dim=-1).squeeze(-2)  # Remove the extra dimension
+            return result
+        
+        elif len(original_shape) == 3:
+            # 3D input: (batch, t, n_agents) - single action Q-values
+            return self._mix_qvals(qvals, states)
+        
+        else:
+            raise ValueError(f"Expected qvals to be 3D or 4D, got shape {original_shape}")
+    
+    def _mix_qvals(self, qvals, states):
+        """
+        Internal method to mix Q-values.
+        Expects qvals to be (batch, t, n_agents)
+        Returns (batch, t, 1)
+        """
         # reshape
         b, t, _ = qvals.size()
         
