@@ -239,7 +239,7 @@ class EvoQLearner:
     def calculate_adversarial_loss(self, batch: EpisodeBatch, mac_index: int):
         """
         Calculate robustness metrics for a specific MAC in the population.
-        Exactly follows the robustness computation logic in train() function.
+        Evaluates robustness at the Global Q-value level (after Mixer).
         
         Args:
             batch: EpisodeBatch containing experience data
@@ -250,42 +250,53 @@ class EvoQLearner:
         """
         # Get the Genome from population
         pop_genome = self.population[mac_index]
-        
-        # Get the relevant quantities for robust regularizer (same as in train())
-        adv_terminated = batch["terminated"].float()
-        adv_mask = batch["filled"].float()
-        adv_mask[:, 1:] = adv_mask[:, 1:] * (1 - adv_terminated[:, :-1])
+        # Get the relevant quantities for robust regularizer
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1]) # whether the sample is valid
         
         # Set both agents to eval mode for evaluation
-        pop_genome.mac1.agent.eval()
-        pop_genome.mac2.agent.eval()
+        pop_genome.eval()
+        adv_batch = noise_atk(batch, self.args)
+        normal_global_q = []
+        adv_global_q = []
         
-        adv_margin = []
+        # compute normal Q
         pop_genome.init_hidden(batch.batch_size)
-        
         with th.no_grad():  # No gradients needed for evaluation
-            for t in range(batch.max_seq_length):
+            for t in range(batch.max_seq_length):  # Exclude last timestep
                 # Normal Q-values from Genome (min of two MACs)
-                agent_outs = pop_genome.forward(batch, t=t)
-                
-                # Calculate adversarial margin
-                adv_batch = noise_atk(batch, self.args)
-                adv_agent_out = pop_genome.forward(adv_batch, t=t)
-                adv_margin.append(get_max_diff(agent_outs, adv_agent_out))
+                agent_out = pop_genome.forward(batch, t=t)  # (batch, n_agents, n_actions)
+                normal_global_q.append(agent_out)
         
-        # Calculate adversarial loss (EXACTLY as in train())
-        adv_margin = th.stack(adv_margin, dim=0).transpose(0, 1) * adv_mask.squeeze(2)  # (batch, seq_len)
-        adv_loss = adv_margin.sum() / adv_mask.sum()
+        # compute adversarial Q
+        pop_genome.init_hidden(batch.batch_size)
+        adv_batch = noise_atk(batch, self.args)
+        with th.no_grad():
+            # Create adversarial batch
+            for t in range(batch.max_seq_length):  # Exclude last timestep
+                # Adversarial Q-values from Genome
+                adv_agent_out = pop_genome.forward(adv_batch, t=t)
+                adv_global_q.append(adv_agent_out)
+        
+        # Stack and take mean over the last dimension (n_actions), then remove it
+        normal_global_q = th.stack(normal_global_q, dim=1).mean(dim=-1)  # (batch, seq_len, n_agents)
+        adv_global_q = th.stack(adv_global_q, dim=1).mean(dim=-1)  # (batch, seq_len, n_agents)
+        
+        # Apply mixer to get Global Q
+        with th.no_grad():
+            normal_global_q = self.mixer(normal_global_q, batch["state"])  # (batch, seq_len, 1)
+            adv_global_q = self.mixer(adv_global_q, adv_batch["state"])  # (batch, seq_len, 1)
+                
+        
+        # Calculate the difference in Global Q-values
+        global_q_diff = th.abs(normal_global_q - adv_global_q).squeeze(2)  # (batch, seq_len-1)
+        
+        # Mask and average
+        masked_diff = global_q_diff[:, :-1] * mask.squeeze(2)
+        adv_loss = masked_diff.sum() / mask.sum()
         
         return adv_loss
-    
-    
-    def Evolve_pop(self):
-        """
-        Evolution operations for the population.
-        TODO: Implement evolution strategy (selection, crossover, mutation)
-        """
-        pass
         
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
         # Get the relevant quantities
@@ -295,12 +306,7 @@ class EvoQLearner:
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1]) # whether the sample is valid
         avail_actions = batch["avail_actions"]
-        
-        # just for robust regularizer
-        adv_terminated = batch["terminated"].float()
-        adv_mask = batch["filled"].float()
-        adv_mask[:, 1:] = adv_mask[:, 1:] * (1 - adv_terminated[:, :-1])
-        
+                
         
         # Calculate estimated Q-Values for BOTH MACs in Genome
         self.Genome.train()  # Set both mac1 and mac2 to train mode

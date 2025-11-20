@@ -263,7 +263,7 @@ def run_sequential(args, logger):
         # run with bests of pop
         # fitness = [[] for _ in range(args.pop_size)]
         replace_index = None
-        if args.EA and runner.t_env > args.start_timesteps:
+        if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
             
             with th.no_grad():
                 for i in best_agents:
@@ -305,7 +305,7 @@ def run_sequential(args, logger):
             del episode_sample
             
             # NSGA begins here
-            if args.EA and runner.t_env > args.start_timesteps:
+            if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
                 # print('EA starts')
                 # Reset fitness to list of lists for append operations
                 fitness = [[] for _ in range(args.pop_size)]
@@ -323,8 +323,8 @@ def run_sequential(args, logger):
                 # print("EA ends.")
 
         # Execute test runs once in a while
-        
-        if args.EA and runner.t_env > args.start_timesteps:
+
+        if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
             # if args.Pareto:
             #     fitness = np.array(fitness)
             #     replace_index = np.argmin(fitness[:, 0]) # replace worst reward

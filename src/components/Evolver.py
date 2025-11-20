@@ -31,6 +31,10 @@ class Genome:
         """Set both agents to training mode."""
         self.mac1.agent.train()
         self.mac2.agent.train()
+    def eval(self):
+        """Set both agents to evaluation mode."""
+        self.mac1.agent.eval()
+        self.mac2.agent.eval()
     
     def init_hidden(self, batch_size):
         """Initialize hidden states for both MACs."""
@@ -265,7 +269,7 @@ class NN_Evolver:
                             # Regularization hard limit
                             W[index, :] = np.clip(W[index, :].cpu(), a_min=-1000000, a_max=1000000)
 
-    def clone(self, master, replace):  # Replace the replacee individual with master
+    def clone(self, master, replace):  # Replace the replace individual with master
 
         for target_param, source_param in zip(replace.parameters(), master.parameters()):
             target_param.data.copy_(source_param.data)
@@ -361,20 +365,11 @@ class NN_Evolver:
                 # selected.extend(sorted_front[:len(pop) // len(pareto_fronts)])  # Select individuals from each front
                 index_rank.extend(front)
             # Elitism: Keep the best individuals (from the first front)
-            elitist_index = index_rank[:self.num_elitists]
-            
-            # Worst individuals: from the last non-empty Pareto front
-            worst_index = []
-            for front in reversed(pareto_fronts):
-                if len(front) > 0:  # Find the last non-empty front
-                    worst_index = front[:self.num_elitists] if len(front) >= self.num_elitists else front
-                    break
+            elitist_index = index_rank[:self.num_elitists]   
         else:
             index_rank = np.argsort(fitness_evals)[::-1]
-
             elitist_index = index_rank[:self.num_elitists]  # Elitist indexes safeguard
-            worst_index = index_rank[-self.num_elitists:]  # Worst individuals
-
+        worst_index = index_rank[int(-0.5 * len(index_rank)):] # replace half of the individuals
         # Selection step
         offsprings = self.selection_tournament(index_rank, num_offsprings=len(index_rank) - self.num_elitists,
                                                tournament_size=3)
@@ -432,6 +427,9 @@ class NN_Evolver:
                 if random.random() < self.args.mutation_prob:
                     self.mutate_inplace(pop[i], agent_level=agent_level)
 
+        # Recalculate worst_index to exclude positions now occupied by elites
+        # worst_index should contain the actual worst performers AFTER elite copying
+        worst_index = [idx for idx in worst_index if idx not in new_elitists]
         return new_elitists, worst_index
 
 
