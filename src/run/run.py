@@ -254,7 +254,26 @@ def run_sequential(args, logger):
 
     start_time = time.time()
     last_time = start_time
-
+    
+    # Learning-assisted dynamic weighting mechanism
+    TD_init = None  # Initial TD error (average of first ~1000 steps)
+    TD_ema = None  # Exponential Moving Average of TD error
+    ema_beta = 0.99  # EMA smoothing factor
+    learning_progress = 0.0  # Current learning progress P_t ∈ [0, 1]
+    alpha_t = 0.0  # Dynamic mixing coefficient for robustness vs optimality
+    
+    # Transfer function parameters for alpha_t
+    P_center = getattr(args, 'alpha_center', 0.5)  # Center point for sigmoid
+    sigmoid_k = getattr(args, 'alpha_steepness', 10.0)  # Steepness of sigmoid
+    
+    # Alternative: Linear ramp parameters
+    use_linear_ramp = getattr(args, 'use_linear_alpha', False)
+    P_start = getattr(args, 'alpha_start', 0.3)  # Start ramping up
+    P_end = getattr(args, 'alpha_end', 0.8)  # Full robustness focus
+    
+    TD_history = []  # Store TD errors for initialization
+    init_steps = getattr(args, 'td_init_steps', 50)  # Steps to compute TD_init
+    
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
 
     while runner.t_env <= args.t_max:
@@ -301,7 +320,55 @@ def run_sequential(args, logger):
             #     learner.args.robust_regular = True
             # else:
             #     learner.args.robust_regular = False
-            learner.train(episode_sample, runner.t_env, episode)
+            info = learner.train(episode_sample, runner.t_env, episode)
+            
+            # Extract TD error from training info (assuming learner returns a dict with TD info)
+            # If learner.train() returns the info dict directly
+            current_TD = info['td_error']
+            # === Learning-Assisted Dynamic Weighting Mechanism ===
+            
+            # Step 1: Initialize TD_init from first 50 training steps (only once!)
+            if TD_init is None:
+                TD_history.append(current_TD)
+                if len(TD_history) >= init_steps:
+                    TD_init = np.mean(TD_history)
+                    TD_ema = TD_init  # Initialize EMA with TD_init
+                    logger.console_logger.info(f"TD_init computed: {TD_init:.6f} (baseline from first {init_steps} steps)")
+            
+            # Step 2: Update EMA of TD error (TD_init remains constant!)
+            else:
+                # TD_init is already set, just update the EMA
+                TD_ema = ema_beta * TD_ema + (1 - ema_beta) * current_TD
+                
+                # Step 3: Compute Learning Progress P_t
+                learning_progress = max(0.0, min(1.0, 1.0 - TD_ema / (TD_init + 1e-8)))
+                
+                # Step 4: Compute dynamic weight alpha_t
+                if use_linear_ramp:
+                    # Linear ramp transfer function
+                    if learning_progress < P_start:
+                        alpha_t = 0.0
+                    elif learning_progress > P_end:
+                        alpha_t = 1.0
+                    else:
+                        alpha_t = (learning_progress - P_start) / (P_end - P_start)
+                else:
+                    # Logistic sigmoid transfer function
+                    alpha_t = 1.0 / (1.0 + np.exp(-sigmoid_k * (learning_progress - P_center)))
+                
+                # Log the adaptive weights
+                if episode % 100 == 0:  # Log every 100 episodes
+                    logger.console_logger.info(
+                        f"[Learning-Assisted EA] Episode {episode} - "
+                        f"Progress: {learning_progress:.3f}, Alpha_t: {alpha_t:.3f}, "
+                        f"TD_ema: {TD_ema:.6f}, TD_init: {TD_init:.6f}"
+                    )
+                    if args.use_tensorboard:
+                        logger.log_stat("learning_progress", learning_progress, runner.t_env)
+                        logger.log_stat("alpha_t", alpha_t, runner.t_env)
+                        logger.log_stat("td_ema", TD_ema, runner.t_env)
+                        logger.log_stat("td_init", TD_init, runner.t_env)
+            
             del episode_sample
             
             # NSGA begins here
@@ -309,17 +376,78 @@ def run_sequential(args, logger):
                 # print('EA starts')
                 # Reset fitness to list of lists for append operations
                 fitness = [[] for _ in range(args.pop_size)]
+                
+                # Determine which robustness confidence metric to use
+                use_evolutionary_consensus = getattr(args, 'use_evolutionary_consensus', False)
+                use_twin_confidence = getattr(args, 'use_twin_adversarial_confidence', False)
+                use_adversarial_novelty = getattr(args, 'use_adversarial_novelty', False)
+                
+                # Get current elite indices for population consensus calculation
+                # Use the best agents from previous epoch (if available)
+                elite_indices = learner.best_agents if hasattr(learner, 'best_agents') else list(range(min(3, args.pop_size)))
+                
                 for i in range(args.pop_size):
-                    # env dynamic fitness (-TD error)
+                    # === Optimality Metrics (左翼) ===
+                    # 1. Environment Fitness: 负 TD Error (衡量Q函数有多准)
                     env_precise_fitness = learner.calculate_TD_error(episode_batch, i)
                     fitness[i].append(-env_precise_fitness.cpu().numpy())
+                    
+                    # 2. Value Confidence: 期望 Q 值 (衡量策略有多强)
                     confidence_Q_fitness = learner.calculate_confidence_Q(episode_batch, i)
                     fitness[i].append(confidence_Q_fitness.cpu().numpy())
-                    # adv margin fitness
+                    
+                    # === Robustness Metrics (右翼) ===
+                    # 3. Attack Sensitivity: 负 Global Q Smoothness (衡量受影响多小)
                     robust_smooth_fitness = learner.calculate_adversarial_loss(episode_batch, i)
                     fitness[i].append(-robust_smooth_fitness.cpu().numpy())
-                elite_index, replace_index = evolver.epoch(population, fitness, agent_level=True)
+                    
+                    # 4. Robustness Confidence / Evolutionary Consensus: 鲁棒性确定性或进化共识
+                    if use_evolutionary_consensus:
+                        # TEVC特供版：进化共识得分 (Evolutionary Consensus Score)
+                        # 结合 Twin-Q 内部一致性 + 种群集成一致性
+                        # F4 = -(KL(π_Q1||π_Q2) + β·KL(π_me||π_ensemble))
+                        evolutionary_consensus = learner.calculate_evolutionary_consensus(
+                            episode_batch, i, elite_indices
+                        )
+                        fitness[i].append(evolutionary_consensus.cpu().numpy())
+                        
+                    elif use_twin_confidence:
+                        # 增强版：计算双重熵+分歧，取负得到"双重自信度"
+                        adversarial_entropy = learner.calculate_twin_adversarial_entropy(episode_batch, i)
+                        robustness_confidence = -adversarial_entropy  # 熵越低，自信度越高
+                        fitness[i].append(robustness_confidence.cpu().numpy())
+                    else:
+                        # 基础版：计算单一熵，取负得到"自信度"
+                        adversarial_entropy = learner.calculate_adversarial_entropy(episode_batch, i)
+                        robustness_confidence = -adversarial_entropy  # 熵越低,自信度越高
+                        fitness[i].append(robustness_confidence.cpu().numpy())
+                    
+                    # 5. Adversarial Behavioral Novelty (Quality-Diversity): 对抗性行为新颖度
+                    if use_adversarial_novelty:
+                        # TEVC特供版：基于存档的新颖度搜索 (Archive-Based Novelty Search)
+                        # 衡量当前个体在对抗样本下的行为与历史精英的差异性
+                        # F5 = avg_distance(π_me(·|o_adv), π_archive(·|o_adv))
+                        adversarial_novelty = learner.calculate_adversarial_novelty(episode_batch, i)
+                        fitness[i].append(adversarial_novelty.cpu().numpy())
+                
+                # Log EA execution with current alpha_t
+                num_objectives = len(fitness[0])
+                consensus_mode = "Evolutionary Consensus" if use_evolutionary_consensus else ("Twin-Q" if use_twin_confidence else "Basic")
+                novelty_mode = " + Novelty" if use_adversarial_novelty else ""
+                logger.console_logger.info(
+                    f"[EA Epoch] Episode {episode}, Mode: {consensus_mode}{novelty_mode}, "
+                    f"Objectives: {num_objectives}, Alpha_t: {alpha_t:.3f} "
+                    f"(Optimality weight: {1-alpha_t:.3f}, Robustness weight: {alpha_t:.3f})"
+                )
+                
+                # Pass alpha_t to evolver for learning-assisted dynamic weighting
+                elite_index, replace_index = evolver.epoch(population, fitness, agent_level=True, alpha_t=alpha_t)
                 best_agents = elite_index
+                
+                # Update elite archive with current elites
+                if use_adversarial_novelty and len(elite_index) > 0:
+                    learner.update_elite_archive(elite_index, episode_batch)
+                
                 # print("EA ends.")
 
         # Execute test runs once in a while

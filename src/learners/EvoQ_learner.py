@@ -1,6 +1,6 @@
 import copy
 from components.episode_buffer import EpisodeBatch
-from modules.mixers.nmix import Mixer
+from modules.mixers.enriched_qmix import Mixer
 from modules.mixers.vdn import VDNMixer
 from modules.mixers.qatten import QattenMixer
 from envs.matrix_game import print_matrix_status
@@ -76,6 +76,11 @@ class EvoQLearner:
         self.elite_size = args.elite_size
         self.population = population
         self.best_agents = list(range(int(self.pop_size*self.elite_size)))
+        
+        # Elite Archive for Novelty Search (Quality-Diversity)
+        self.elite_archive = []  # Stores behavioral descriptors of historical elites
+        self.archive_max_size = getattr(args, 'archive_max_size', 50)  # Maximum archive size
+        self.novelty_k_nearest = getattr(args, 'novelty_k_nearest', 5)  # K-nearest neighbors for novelty
         
 
     def get_params(self):
@@ -290,8 +295,456 @@ class EvoQLearner:
                 
         
         # Calculate the difference in Global Q-values
-        return get_diff(normal_global_q, adv_global_q).mean()
+        return get_diff(normal_global_q, adv_global_q).sum() / mask.sum()
 
+    def calculate_adversarial_entropy(self, batch, mac_index):
+        """
+        Calculate adversarial entropy for robustness evaluation.
+        
+        Entropy measures the uncertainty/confusion in the policy's decision distribution
+        under adversarial perturbations. Lower entropy = more certain/confident decision.
+        
+        This is the foundation metric (计算熵), while the caller interprets it as
+        "robustness confidence" (鲁棒自信度) by taking the negative.
+        
+        Symmetry with other metrics:
+        - Optimality side: TD Error (accuracy) + Q Value (ambition)
+        - Robustness side: Q Smoothness (stability) + Entropy (certainty foundation)
+        
+        Args:
+            batch: EpisodeBatch containing experience data
+            mac_index: Index of the MAC in self.population to evaluate
+            
+        Returns:
+            neg_entropy: Negative entropy (higher = more confident/robust)
+        """
+        # Get the Genome from population
+        pop_genome = self.population[mac_index]
+        
+        # Get mask for valid timesteps
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        
+        # Set to eval mode
+        pop_genome.eval()
+        
+        # Create adversarial observations
+        adv_batch = noise_atk(batch, self.args)
+        
+        # Compute adversarial Global Q-values for all actions
+        pop_genome.init_hidden(batch.batch_size)
+        adv_global_q_list = []
+        
+        with th.no_grad():
+            for t in range(batch.max_seq_length):
+                # Get Q-values for all actions from Genome (min of mac1 and mac2)
+                agent_out = pop_genome.forward(adv_batch, t=t)  # (batch, n_agents, n_actions)
+                adv_global_q_list.append(agent_out)
+        
+        # Stack: (batch, seq_len, n_agents, n_actions)
+        adv_agent_q = th.stack(adv_global_q_list, dim=1)
+        
+        # Apply mixer to get Global Q for all actions
+        # mixer handles 4D input: (batch, seq_len, n_agents, n_actions) -> (batch, seq_len-1, n_actions)
+        with th.no_grad():
+            adv_global_q = self.mixer(adv_agent_q, adv_batch["state"])[:, :-1]  # (batch, seq_len-1, n_actions)
+        
+        # Compute Boltzmann distribution (softmax with temperature)
+        tau = getattr(self.args, 'adversarial_tau', 1.0)  # Temperature parameter
+        
+        # Compute probabilities: π(a|o_adv) = softmax(Q_tot(o_adv, a) / τ)
+        log_probs = th.nn.functional.log_softmax(adv_global_q / tau, dim=-1)  # (batch, seq_len-1, n_actions)
+        probs = th.exp(log_probs)  # (batch, seq_len-1, n_actions)
+        
+        # Compute entropy: H(π) = -Σ π(a) log π(a)
+        entropy = -(probs * log_probs).sum(dim=-1)  # (batch, seq_len-1)
+        
+        # Apply mask and compute mean
+        masked_entropy = entropy * mask.unsqueeze(-1)
+        mean_entropy = masked_entropy.sum() / mask.sum()
+        
+        # Return entropy directly (caller will negate it for "confidence" interpretation)
+        return mean_entropy
+    
+    def calculate_twin_adversarial_entropy(self, batch, mac_index):
+        """
+        Enhanced version: Twin Adversarial Entropy.
+        
+        Computes a combined metric of entropy from both Q-networks plus their disagreement.
+        Lower value = both networks are confident AND in agreement.
+        
+        This is the foundation metric (计算熵+分歧), while the caller interprets it as
+        "twin robustness confidence" (双重鲁棒自信度) by taking the negative.
+        
+        Fitness = -(H(π1) + H(π2) + λ·KL(π1||π2))
+        
+        This ensures both networks are:
+        1. Individually confident (low entropy)
+        2. In agreement with each other (low KL divergence)
+        
+        Args:
+            batch: EpisodeBatch containing experience data
+            mac_index: Index of the MAC in self.population to evaluate
+            
+        Returns:
+            twin_conf: Negative of (entropy1 + entropy2 + λ·KL divergence)
+        """
+        # Get the Genome from population
+        pop_genome = self.population[mac_index]
+        
+        # Get mask for valid timesteps
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        
+        # Set to eval mode
+        pop_genome.eval()
+        
+        # Create adversarial observations
+        adv_batch = noise_atk(batch, self.args)
+        
+        # Compute Global Q-values from both MACs
+        pop_genome.mac1.init_hidden(batch.batch_size)
+        pop_genome.mac2.init_hidden(batch.batch_size)
+        
+        adv_q1_list = []
+        adv_q2_list = []
+        
+        with th.no_grad():
+            for t in range(batch.max_seq_length):
+                # Q-values from mac1
+                agent_out1 = pop_genome.mac1.forward(adv_batch, t=t)  # (batch, n_agents, n_actions)
+                adv_q1_list.append(agent_out1)
+                
+                # Q-values from mac2
+                agent_out2 = pop_genome.mac2.forward(adv_batch, t=t)  # (batch, n_agents, n_actions)
+                adv_q2_list.append(agent_out2)
+        
+        # Stack: (batch, seq_len, n_agents, n_actions)
+        adv_agent_q1 = th.stack(adv_q1_list, dim=1)
+        adv_agent_q2 = th.stack(adv_q2_list, dim=1)
+        
+        # Apply mixer to get Global Q for all actions
+        with th.no_grad():
+            adv_global_q1 = self.mixer(adv_agent_q1, adv_batch["state"])[:, :-1]  # (batch, seq_len-1, n_actions)
+            adv_global_q2 = self.mixer(adv_agent_q2, adv_batch["state"])[:, :-1]  # (batch, seq_len-1, n_actions)
+        
+        # Compute Boltzmann distributions
+        tau = getattr(self.args, 'adversarial_tau', 1.0)
+        
+        log_probs1 = th.nn.functional.log_softmax(adv_global_q1 / tau, dim=-1)
+        log_probs2 = th.nn.functional.log_softmax(adv_global_q2 / tau, dim=-1)
+        probs1 = th.exp(log_probs1)
+        probs2 = th.exp(log_probs2)
+        
+        # Compute individual entropies
+        entropy1 = -(probs1 * log_probs1).sum(dim=-1)  # (batch, seq_len-1)
+        entropy2 = -(probs2 * log_probs2).sum(dim=-1)  # (batch, seq_len-1)
+        
+        # Compute KL divergence: KL(π1||π2) = Σ π1(a) log(π1(a)/π2(a))
+        kl_div = (probs1 * (log_probs1 - log_probs2)).sum(dim=-1)  # (batch, seq_len-1)
+        
+        # Weight for KL term
+        kl_weight = getattr(self.args, 'kl_weight', 0.5)
+        
+        # Combined metric: H1 + H2 + λ·KL (all positive, higher = worse)
+        combined_metric = entropy1 + entropy2 + kl_weight * kl_div  # (batch, seq_len-1)
+        
+        # Apply mask and compute mean
+        masked_metric = combined_metric * mask
+        mean_metric = masked_metric.sum() / mask.sum()
+        
+        # Return the combined entropy+divergence (caller will negate for "confidence")
+        return mean_metric
+
+    def calculate_evolutionary_consensus(self, batch, mac_index, elite_indices):
+        """
+        Calculate Evolutionary Consensus Score (TEVC-native metric).
+        
+        Combines:
+        1. Internal Consistency: KL divergence between Twin Q-networks
+        2. Evolutionary Consensus: KL divergence between individual and population ensemble
+        
+        This metric leverages the unique advantage of evolutionary algorithms - 
+        having access to multiple elite individuals for ensemble-based robustness.
+        
+        Fitness = -(KL(π_Q1||π_Q2) + β·KL(π_me||π_ensemble))
+        
+        Args:
+            batch: EpisodeBatch containing experience data
+            mac_index: Index of current individual to evaluate
+            elite_indices: List of indices of elite individuals in population
+            
+        Returns:
+            consensus_score: Negative of combined KL divergence (higher = better consensus)
+        """
+        # Get the Genome from population
+        pop_genome = self.population[mac_index]
+        
+        # Get mask for valid timesteps
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        
+        # Set to eval mode
+        pop_genome.eval()
+        
+        # Create adversarial observations
+        adv_batch = noise_atk(batch, self.args)
+        
+        # === Part 1: Internal Consistency (Twin-Q Networks) ===
+        pop_genome.mac1.init_hidden(batch.batch_size)
+        pop_genome.mac2.init_hidden(batch.batch_size)
+        
+        adv_q1_list = []
+        adv_q2_list = []
+        
+        with th.no_grad():
+            for t in range(batch.max_seq_length):
+                # Q-values from mac1
+                agent_out1 = pop_genome.mac1.forward(adv_batch, t=t)  # (batch, n_agents, n_actions)
+                adv_q1_list.append(agent_out1)
+                
+                # Q-values from mac2
+                agent_out2 = pop_genome.mac2.forward(adv_batch, t=t)  # (batch, n_agents, n_actions)
+                adv_q2_list.append(agent_out2)
+        
+        # Stack and apply mixer
+        adv_agent_q1 = th.stack(adv_q1_list, dim=1)
+        adv_agent_q2 = th.stack(adv_q2_list, dim=1)
+        
+        with th.no_grad():
+            adv_global_q1 = self.mixer(adv_agent_q1, adv_batch["state"])[:, :-1]  # (batch, seq_len-1, n_actions)
+            adv_global_q2 = self.mixer(adv_agent_q2, adv_batch["state"])[:, :-1]  # (batch, seq_len-1, n_actions)
+        
+        # Compute Boltzmann distributions
+        tau = getattr(self.args, 'adversarial_tau', 1.0)
+        
+        log_probs1 = th.nn.functional.log_softmax(adv_global_q1 / tau, dim=-1)
+        log_probs2 = th.nn.functional.log_softmax(adv_global_q2 / tau, dim=-1)
+        probs1 = th.exp(log_probs1)
+        probs2 = th.exp(log_probs2)
+        
+        # KL divergence between twin networks: KL(π1||π2)
+        kl_internal = (probs1 * (log_probs1 - log_probs2)).sum(dim=-1)  # (batch, seq_len-1)
+        
+        # === Part 2: Evolutionary Consensus (Population Ensemble) ===
+        # Build ensemble policy from elite individuals
+        K = min(len(elite_indices), getattr(self.args, 'ensemble_size', 3))  # Top-K elites
+        if K == 0 or mac_index in elite_indices[:K]:
+            # If no elites or evaluating an elite itself, skip ensemble term
+            kl_ensemble = th.zeros_like(kl_internal)
+        else:
+            # Sample K elite individuals (excluding self if present)
+            selected_elites = [idx for idx in elite_indices[:K] if idx != mac_index][:K]
+            
+            if len(selected_elites) == 0:
+                kl_ensemble = th.zeros_like(kl_internal)
+            else:
+                # Collect Q-values from elite individuals
+                elite_global_qs = []
+                for elite_idx in selected_elites:
+                    elite_genome = self.population[elite_idx]
+                    elite_genome.eval()
+                    elite_genome.init_hidden(batch.batch_size)
+                    
+                    elite_q_list = []
+                    with th.no_grad():
+                        for t in range(batch.max_seq_length):
+                            elite_out = elite_genome.forward(adv_batch, t=t)
+                            elite_q_list.append(elite_out)
+                    
+                    elite_agent_q = th.stack(elite_q_list, dim=1)
+                    with th.no_grad():
+                        elite_global_q = self.mixer(elite_agent_q, adv_batch["state"])[:, :-1]
+                    elite_global_qs.append(elite_global_q)
+                
+                # Ensemble: average Q-values from elites
+                ensemble_q = th.stack(elite_global_qs, dim=0).mean(dim=0)  # (batch, seq_len-1, n_actions)
+                
+                # Compute ensemble policy distribution
+                log_probs_ensemble = th.nn.functional.log_softmax(ensemble_q / tau, dim=-1)
+                probs_ensemble = th.exp(log_probs_ensemble)
+                
+                # Use mean of individual's two networks for comparison
+                probs_me = (probs1 + probs2) / 2.0
+                log_probs_me = th.log(probs_me + 1e-8)
+                
+                # KL divergence between individual and ensemble: KL(π_me||π_ensemble)
+                kl_ensemble = (probs_me * (log_probs_me - log_probs_ensemble)).sum(dim=-1)  # (batch, seq_len-1)
+        
+        # === Combine both terms ===
+        beta = getattr(self.args, 'ensemble_consensus_weight', 0.5)  # Weight for ensemble term
+        
+        combined_kl = kl_internal + beta * kl_ensemble  # (batch, seq_len-1)
+        
+        # Apply mask and compute mean
+        masked_kl = combined_kl * mask.unsqueeze(-1)
+        mean_kl = masked_kl.sum() / mask.sum()
+        
+        # Return negative (higher consensus = lower KL = higher fitness)
+        return -mean_kl
+    
+    def calculate_adversarial_novelty(self, batch, mac_index):
+        """
+        Calculate Adversarial Behavioral Novelty (Quality-Diversity metric).
+        
+        Measures how different an individual's behavior is compared to historical elites
+        under adversarial perturbations. This encourages diversity in robustness strategies.
+        
+        Novelty = avg_distance(π_me(·|o_adv), π_archive(·|o_adv))
+        
+        This metric promotes:
+        1. Behavioral diversity: Different robust strategies, not just one
+        2. Quality-Diversity: Robustness through diverse defensive patterns
+        3. Attack resistance: Harder to find universal attacks
+        
+        Args:
+            batch: EpisodeBatch containing experience data
+            mac_index: Index of current individual to evaluate
+            
+        Returns:
+            novelty_score: Average behavioral distance to archive (higher = more novel)
+        """
+        # Get the Genome from population
+        pop_genome = self.population[mac_index]
+        
+        # Get mask for valid timesteps
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        
+        # Set to eval mode
+        pop_genome.eval()
+        
+        # Create adversarial observations
+        adv_batch = noise_atk(batch, self.args)
+        
+        # === Compute current individual's behavioral descriptor ===
+        pop_genome.init_hidden(batch.batch_size)
+        adv_q_list = []
+        
+        with th.no_grad():
+            for t in range(batch.max_seq_length):
+                agent_out = pop_genome.forward(adv_batch, t=t)  # (batch, n_agents, n_actions)
+                adv_q_list.append(agent_out)
+        
+        # Stack and apply mixer
+        adv_agent_q = th.stack(adv_q_list, dim=1)
+        with th.no_grad():
+            adv_global_q = self.mixer(adv_agent_q, adv_batch["state"])[:, :-1]  # (batch, seq_len-1, n_actions)
+        
+        # Compute action distribution (Boltzmann policy)
+        tau = getattr(self.args, 'adversarial_tau', 1.0)
+        probs_me = th.nn.functional.softmax(adv_global_q / tau, dim=-1)  # (batch, seq_len-1, n_actions)
+        
+        # Behavioral descriptor: mean action distribution over time
+        # Shape: (batch, n_actions)
+        behavior_me = probs_me.mean(dim=1)  # Average over time dimension
+        
+        # === Calculate novelty against archive ===
+        if len(self.elite_archive) == 0:
+            # Empty archive: maximum novelty (encourage exploration)
+            novelty_score = th.tensor(1.0, device=self.device)
+        else:
+            # Compute distance to each archived behavior
+            distances = []
+            for archived_behavior in self.elite_archive:
+                # archived_behavior: (batch, n_actions) tensor
+                # Use JS divergence (symmetrized KL) as distance metric
+                dist = self._js_divergence(behavior_me, archived_behavior)
+                distances.append(dist)
+            
+            # Stack distances: (num_archived, batch)
+            distances_tensor = th.stack(distances, dim=0)
+            
+            # Novelty = average distance to K-nearest neighbors
+            K = min(self.novelty_k_nearest, len(self.elite_archive))
+            
+            # For each batch element, find K-nearest neighbors
+            # Shape: (batch, num_archived)
+            distances_transposed = distances_tensor.t()
+            
+            # Get K smallest distances for each batch element
+            knn_distances, _ = th.topk(distances_transposed, K, dim=1, largest=False)
+            
+            # Novelty = mean of K-nearest distances
+            novelty_per_sample = knn_distances.mean(dim=1)  # (batch,)
+            
+            # Apply mask and average over batch
+            novelty_score = (novelty_per_sample * mask.mean(dim=1)).sum() / (mask.mean(dim=1).sum() + 1e-8)
+        
+        return novelty_score
+    
+    def _js_divergence(self, p, q):
+        """
+        Compute Jensen-Shannon divergence between two distributions.
+        JS(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M), where M = (P+Q)/2
+        
+        Args:
+            p, q: Probability distributions, shape (batch, n_actions)
+            
+        Returns:
+            js_div: JS divergence for each batch element, shape (batch,)
+        """
+        # Ensure valid probabilities
+        p = p + 1e-8
+        q = q + 1e-8
+        p = p / p.sum(dim=-1, keepdim=True)
+        q = q / q.sum(dim=-1, keepdim=True)
+        
+        # Mixture distribution
+        m = 0.5 * (p + q)
+        
+        # KL divergences
+        kl_pm = (p * (th.log(p) - th.log(m))).sum(dim=-1)
+        kl_qm = (q * (th.log(q) - th.log(m))).sum(dim=-1)
+        
+        # JS divergence
+        js_div = 0.5 * kl_pm + 0.5 * kl_qm
+        
+        return js_div
+    
+    def update_elite_archive(self, elite_indices, batch):
+        """
+        Update the elite archive with behavioral descriptors from current elites.
+        
+        Args:
+            elite_indices: List of indices of elite individuals
+            batch: EpisodeBatch for computing behavioral descriptors
+        """
+        # Create adversarial batch
+        adv_batch = noise_atk(batch, self.args)
+        tau = getattr(self.args, 'adversarial_tau', 1.0)
+        
+        # Compute behavioral descriptors for each elite
+        for elite_idx in elite_indices[:min(len(elite_indices), 5)]:  # Add top-5 elites
+            elite_genome = self.population[elite_idx]
+            elite_genome.eval()
+            elite_genome.init_hidden(batch.batch_size)
+            
+            adv_q_list = []
+            with th.no_grad():
+                for t in range(batch.max_seq_length):
+                    agent_out = elite_genome.forward(adv_batch, t=t)
+                    adv_q_list.append(agent_out)
+            
+            adv_agent_q = th.stack(adv_q_list, dim=1)
+            with th.no_grad():
+                adv_global_q = self.mixer(adv_agent_q, adv_batch["state"])[:, :-1]
+            
+            # Behavioral descriptor: mean action distribution
+            probs = th.nn.functional.softmax(adv_global_q / tau, dim=-1)
+            behavior = probs.mean(dim=1)  # (batch, n_actions)
+            
+            # Add to archive (detach and clone to avoid memory issues)
+            self.elite_archive.append(behavior.detach().clone())
+        
+        # Maintain archive size (FIFO)
+        if len(self.elite_archive) > self.archive_max_size:
+            # Remove oldest entries
+            self.elite_archive = self.elite_archive[-self.archive_max_size:]
         
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
         # Get the relevant quantities
@@ -434,6 +887,11 @@ class EvoQLearner:
                 td_error_combined = td_error_1 + td_error_2
                 info["td_errors_abs"] = ((td_error_combined.abs() * mask).sum(1) \
                                 / th.sqrt(mask.sum(1))).detach().to('cpu')
+        
+        # Store TD error for learning-assisted dynamic weighting
+        self.last_td_error = L_td.item()
+        info["td_error"] = self.last_td_error
+        
         return info
 
     def _update_targets(self):

@@ -89,7 +89,7 @@ class Mixer(nn.Module):
         w2 = self.hyper_w2(states).view(-1, self.embed_dim, 1) # b * t, emb, 1
         b2= self.hyper_b2(states).view(-1, 1, 1)
         
-        if self.abs:
+        if self.abs: # monotonicity constraint
             w1 = self.pos_func(w1)
             w2 = self.pos_func(w2)
             

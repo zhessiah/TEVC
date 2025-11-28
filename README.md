@@ -69,7 +69,7 @@ bash run.sh m3ddpg stag_hunt stag_hunt t_max=5050000 1 2 1
 
 bash run.sh EvoQ mpe simple_spread epsilon_anneal_time=500000,td_lambda=0.3 1 0 1
 
-bash run.sh EvoQ sc2 8m_vs_9m epsilon_anneal_time=500000,td_lambda=0.3 1 0 1
+bash run.sh EvoQ sc2 5m_vs_6m epsilon_anneal_time=500000,td_lambda=0.3 1 2 1
 
 bash run.sh qatten gfootball academy_counterattack_easy epsilon_anneal_time=500000,td_lambda=0.3 1 1 1
 

@@ -280,16 +280,92 @@ class NN_Evolver:
         for param in (gene.parameters()):
             param.data.copy_(param.data)
 
-    def pareto_dominates(self, individual1, individual2):
+    def pareto_dominates(self, individual1, individual2, alpha_t=0.0):
+        """
+        Weighted Pareto dominance based on learning progress.
+        
+        Symmetry Structure (4 objectives):
+        - Optimality (左翼): 
+            f[0] = -TD_error (环境拟合 - accuracy)
+            f[1] = confidence_Q (价值自信 - ambition)
+        - Robustness (右翼):
+            f[2] = -adversarial_loss (攻击敏感度 - stability) 
+            f[3] = adversarial_confidence (鲁棒自信度 - certainty)
+        
+        Extended Structure (5 objectives):
+        - Optimality (左翼):
+            f[0] = -TD_error (环境拟合 - accuracy)
+            f[1] = confidence_Q (价值自信 - ambition)
+        - Robustness + Diversity (右翼):
+            f[2] = -adversarial_loss (攻击敏感度 - stability)
+            f[3] = adversarial_confidence (鲁棒自信度 - certainty)
+            f[4] = adversarial_novelty (对抗性新颖度 - diversity)
+        
+        Args:
+            individual1, individual2: Fitness tuples (3D, 4D, or 5D)
+            alpha_t: Learning progress weight ∈ [0, 1]
+                - alpha_t = 0: Focus on optimality
+                - alpha_t = 1: Focus on robustness
+        
+        Weighting scheme:
+            w_optimality = 1 - alpha_t  (decreases as learning progresses)
+            w_robustness = alpha_t      (increases as learning progresses)
+        """
+        # Determine number of objectives
+        n_objectives = len(individual1)
+        
+        if n_objectives == 5:
+            # 5-objective case: Symmetrical weighting with Quality-Diversity
+            # Optimality side (f[0], f[1]): split w_optimality equally
+            # Robustness side (f[2], f[3], f[4]): split w_robustness equally
+            w_optimality = 1.0 - alpha_t
+            w_robustness = alpha_t
+            
+            weights = [
+                w_optimality / 2.0,  # f[0]: -TD_error (环境拟合)
+                w_optimality / 2.0,  # f[1]: confidence_Q (价值自信)
+                w_robustness / 3.0,  # f[2]: -adversarial_loss (攻击敏感度)
+                w_robustness / 3.0,  # f[3]: adversarial_confidence (鲁棒自信度)
+                w_robustness / 3.0   # f[4]: adversarial_novelty (对抗性新颖度)
+            ]
+        elif n_objectives == 4:
+            # 4-objective case: Symmetrical weighting
+            # Optimality side (f[0], f[1]): split w_optimality equally
+            # Robustness side (f[2], f[3]): split w_robustness equally
+            w_optimality = 1.0 - alpha_t
+            w_robustness = alpha_t
+            
+            weights = [
+                w_optimality / 2.0,  # f[0]: -TD_error (环境拟合)
+                w_optimality / 2.0,  # f[1]: confidence_Q (价值自信)
+                w_robustness / 2.0,  # f[2]: -adversarial_loss (攻击敏感度)
+                w_robustness / 2.0   # f[3]: adversarial_confidence (鲁棒自信度)
+            ]
+        elif n_objectives == 3:
+            # 3-objective case (backward compatibility): 
+            # f[0] = optimality (full weight)
+            # f[1], f[2] = robustness (split weight)
+            w_optimality = 1.0 - alpha_t
+            w_robustness = alpha_t
+            weights = [w_optimality, w_robustness / 2.0, w_robustness / 2.0]
+        else:
+            # Fallback: equal weights
+            weights = [1.0 / n_objectives] * n_objectives
+        
+        # Scale each objective by its weight
+        weighted_f1 = [f * w for f, w in zip(individual1, weights)]
+        weighted_f2 = [f * w for f, w in zip(individual2, weights)]
+        
+        # Standard Pareto dominance on weighted objectives
         better_in_one = False
-        for f1, f2 in zip(individual1, individual2):
+        for f1, f2 in zip(weighted_f1, weighted_f2):
             if f1 < f2:
                 return False
             elif f1 > f2:
                 better_in_one = True
         return better_in_one
 
-    def non_dominated_sorting(self, population):
+    def non_dominated_sorting(self, population, alpha_t=0.0):
         pareto_fronts = []
         domination_counts = {i: 0 for i in range(len(population))} # 每个个体被支配的次数
         dominated_solutions = {i: [] for i in range(len(population))} # 每个个体支配的个体列表
@@ -298,9 +374,9 @@ class NN_Evolver:
 
         for i in range(len(population)):
             for j in range(len(population)):
-                if self.pareto_dominates(population[i], population[j]):
+                if self.pareto_dominates(population[i], population[j], alpha_t=alpha_t):
                     dominated_solutions[i].append(j)
-                elif self.pareto_dominates(population[j], population[i]):
+                elif self.pareto_dominates(population[j], population[i], alpha_t=alpha_t):
                     domination_counts[i] += 1
 
             if domination_counts[i] == 0:
@@ -322,12 +398,37 @@ class NN_Evolver:
 
     def fitness_split(self, fitness):
         """
-        multi fitnesses
+        Split multi-objective fitness into individual components.
+        
+        Supports 3, 4, and 5 objective cases:
+        - 3 objectives (legacy): TD_error, confidence_Q, adversarial_loss
+        - 4 objectives: TD_error, confidence_Q, adversarial_loss, adversarial_confidence
+        - 5 objectives: TD_error, confidence_Q, adversarial_loss, adversarial_confidence, adversarial_novelty
         """
-        env_precise_fitness = fitness[0]
-        confidence_Q_fitness = fitness[1]
-        uncertainty_fitness = fitness[2]
-        return env_precise_fitness, confidence_Q_fitness, uncertainty_fitness
+        if len(fitness) == 5:
+            # 5-objective case: Quality-Diversity structure
+            env_precise_fitness = fitness[0]      # -TD_error (环境拟合)
+            confidence_Q_fitness = fitness[1]     # confidence_Q (价值自信)
+            adversarial_loss = fitness[2]         # -adversarial_loss (攻击敏感度)
+            adversarial_confidence = fitness[3]   # adversarial_confidence (鲁棒自信度)
+            adversarial_novelty = fitness[4]      # adversarial_novelty (对抗性新颖度)
+            return env_precise_fitness, confidence_Q_fitness, adversarial_loss, adversarial_confidence, adversarial_novelty
+        elif len(fitness) == 4:
+            # 4-objective case: Symmetrical structure
+            env_precise_fitness = fitness[0]      # -TD_error (环境拟合)
+            confidence_Q_fitness = fitness[1]     # confidence_Q (价值自信)
+            adversarial_loss = fitness[2]         # -adversarial_loss (攻击敏感度)
+            adversarial_confidence = fitness[3]   # adversarial_confidence (鲁棒自信度)
+            return env_precise_fitness, confidence_Q_fitness, adversarial_loss, adversarial_confidence
+        elif len(fitness) == 3:
+            # 3-objective case (backward compatibility)
+            env_precise_fitness = fitness[0]
+            confidence_Q_fitness = fitness[1]
+            uncertainty_fitness = fitness[2]
+            return env_precise_fitness, confidence_Q_fitness, uncertainty_fitness
+        else:
+            # Fallback: return as tuple
+            return tuple(fitness)
 
     def calculate_crowding_distance(self, front, population):
         distances = {i: 0 for i in front}
@@ -345,13 +446,22 @@ class NN_Evolver:
 
         return distances
 
-    def epoch(self, pop, fitness_evals, agent_level=False):
+    def epoch(self, pop, fitness_evals, agent_level=False, alpha_t=0.0):
+        """
+        One epoch of evolutionary algorithm with learning-assisted dynamic weighting.
+        
+        Args:
+            pop: Population of Genome objects
+            fitness_evals: List of fitness tuples for each individual
+            agent_level: Whether to use agent-level operations
+            alpha_t: Learning progress weight for adaptive multi-objective optimization
+        """
         # Entire epoch is handled with indices; Index rank nets by fitness evaluation (0 is the best after reversing)
 
         if self.args.Pareto:
             population = [self.fitness_split(fitness) for fitness in fitness_evals]
 
-            pareto_fronts = self.non_dominated_sorting(population)
+            pareto_fronts = self.non_dominated_sorting(population, alpha_t=alpha_t)
 
             # Calculate crowding distance for each front
             crowding_distances = {}

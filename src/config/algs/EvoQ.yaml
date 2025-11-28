@@ -49,4 +49,38 @@ return_priority: False
 pop_size: 10
 elite_size: 0.2
 
+# --- Evolutionary Mechanisms (TEVC-specific) ---
+
+# Mechanism 1: Twin Adversarial Confidence
+use_twin_adversarial_confidence: True  # Use Twin-Q networks for robust confidence estimation
+adversarial_tau: 1.0                    # Boltzmann temperature for policy distribution
+kl_weight: 0.5                          # Weight for KL divergence term in twin confidence
+
+# Mechanism 2: Evolutionary Consensus (Population-Level Robustness)
+use_evolutionary_consensus: True       # Enable population consensus metric (F4)
+ensemble_size: 3                        # Number of elite agents for ensemble
+ensemble_consensus_weight: 0.5          # β weight for ensemble vs internal consistency
+
+# Mechanism 3: Adversarial Behavioral Novelty (Quality-Diversity)
+use_adversarial_novelty: False          # Enable archive-based novelty search (F5)
+archive_max_size: 50                    # Maximum size of elite behavior archive
+novelty_k_nearest: 5                    # K for K-nearest neighbor novelty calculation
+
+# Mechanism 4-5: Byzantine Fault Tolerance 
+use_byzantine_tolerance: True          # Enable Byzantine fault tolerance mode (F6, F7)
+byzantine_fault_probability: 0.2        # Probability of simulating a faulty agent per episode
+byzantine_attack_type: "worst_action"   # "worst_action", "random", or "opposite"
+influence_perturbation: 0.5             # δ for measuring agent influence: Q_k → Q_k + δ
+max_influence_weight: 0.7               # α weight for max influence penalty in F7
+variance_weight: 0.3                    # β weight for influence variance penalty in F7
+
+# Learning-Assisted Dynamic Weighting (Mechanism 2 core)
+transfer_function: "sigmoid"            # Transfer function for alpha_t: "sigmoid" or "linear"
+sigmoid_k: 10.0                         # Steepness of sigmoid for alpha_t
+alpha_center: 0.5                       # Center point for sigmoid
+alpha_start: 0.3                        # Start point for linear ramp
+alpha_end: 0.8                          # End point for linear ramp
+td_ema_beta: 0.99                       # EMA decay rate for TD error tracking
+td_init_steps: 50                       # Number of steps to compute initial TD_init
+
 name: "EvoQ_env=8_adam_td_lambda"
