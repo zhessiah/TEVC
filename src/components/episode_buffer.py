@@ -101,6 +101,8 @@ class EpisodeBatch:
 
             dtype = self.scheme[k].get("dtype", th.float32)
             v = th.tensor(v, dtype=dtype, device=self.device, requires_grad=v.requires_grad if isinstance(v, th.Tensor) else False)
+            # print("k:{},v:{},target[k].shape:{},v.shape:{}".format(k,v,target[k].shape,v.shape))
+            # print("slices:",_slices)
             self._check_safe_view(v, target[k][_slices])
             target[k][_slices] = v.view_as(target[k][_slices])
 
@@ -113,12 +115,15 @@ class EpisodeBatch:
 
     def _check_safe_view(self, v, dest):
         idx = len(v.shape) - 1
+        # print("dest.shape:{},dest.shape[:-1]:{}".format(dest.shape,dest.shape[:-1]))
         for s in dest.shape[::-1]:
             if v.shape[idx] != s:
                 if s != 1:
                     raise ValueError("Unsafe reshape of {} to {}".format(v.shape, dest.shape))
             else:
                 idx -= 1
+            if idx < 0:
+                break
 
     def __getitem__(self, item):
         if isinstance(item, str):

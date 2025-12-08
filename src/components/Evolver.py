@@ -58,6 +58,13 @@ class Genome:
         chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
         return chosen_actions
     
+    def select_byzantine_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
+        """Select byzantine actions using the minimum Q-values from both MACs."""
+        # avail_actions = ep_batch["avail_actions"][:, t_ep]
+        # agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)        
+        ori_actions, worst_actions, which_agent_to_attack = self.mac1.select_actions(ep_batch, t_ep, t_env, bs, test_mode=test_mode)
+        return ori_actions, worst_actions, which_agent_to_attack
+    
     def parameters(self):
         """Return parameters from both MACs."""
         return chain(self.mac1.parameters(), self.mac2.parameters())

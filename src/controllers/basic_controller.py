@@ -13,16 +13,37 @@ class BasicMAC:
         self.agent_output_type = args.agent_output_type
 
         self.action_selector = action_REGISTRY[args.action_selector](args)
+        self.attack_agent_selector = action_REGISTRY[args.attack_agent_selector](args)
         self.save_probs = getattr(self.args, 'save_probs', False)
 
         self.hidden_states = None
+        
+    def set_attacker(self, attacker):
+        self.attacker = attacker
 
+    def get_victim_id(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
+        attacker_outputs = self.attacker.batch_forward(ep_batch, t_ep)
+        victim_id = self.attack_agent_selector.select_action(attacker_outputs[bs], t_env, test_mode=test_mode)
+        return victim_id
+    
     def select_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
         # Only select actions for the selected batch elements in bs
         avail_actions = ep_batch["avail_actions"][:, t_ep]
         agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)
         chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
+        if self.args.adversarial_training:
+            byzantine_actions = self.action_selector.select_byzantine_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
+            victim_id = self.get_victim_id(ep_batch, t_ep, t_env, bs, test_mode)
+            return chosen_actions, byzantine_actions, victim_id
         return chosen_actions
+    
+    def select_byzantine_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
+        # Only select actions for the selected batch elements in bs
+
+        avail_actions = ep_batch["avail_actions"][:, t_ep]
+        agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)
+        byzantine_actions = self.action_selector.select_byzantine_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
+        return byzantine_actions
 
     def forward(self, ep_batch, t, test_mode=False):
         agent_inputs = self._build_inputs(ep_batch, t)

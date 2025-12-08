@@ -7,7 +7,9 @@ import torch as th
 import copy
 from components.attacker import MLPAttacker
 
-class ParallelRunner:
+# Based (very) heavily on SubprocVecEnv from OpenAI Baselines
+# https://github.com/openai/baselines/blob/master/baselines/common/vec_env/subproc_vec_env.py
+class Robust_ParallelRunner:
 
     def __init__(self, args, logger):
         self.args = args
@@ -43,12 +45,17 @@ class ParallelRunner:
         self.log_train_stats_t = -100000
         self.attacker_pop_size = args.attacker_pop_size
         
-        if args.adv_training:
-            self.attacker_population = []
-            for i in range(self.attacker_pop_size):
-                self.attacker_population.append(MLPAttacker(args))
+        env_info = self.get_env_info()
+        self.args.n_agents = env_info["n_agents"]
+        self.args.n_actions = env_info["n_actions"]
+        self.args.state_shape = env_info["state_shape"]
+        self.args.episode_limit = env_info["episode_limit"]
+
         
-        
+        self.attacker_population = []
+        for i in range(self.attacker_pop_size):
+            self.attacker_population.append(MLPAttacker(args))
+
 
     def setup(self, scheme, groups, preprocess, mac):
         self.new_batch = partial(EpisodeBatch, scheme, groups, self.batch_size, self.episode_limit + 1,
@@ -79,21 +86,23 @@ class ParallelRunner:
         pre_transition_data = {
             "state": [],
             "avail_actions": [],
-            "obs": []
+            "obs": [],
+            "left_attack": []
         }
         # Get the obs, state and avail_actions back
         for parent_conn in self.parent_conns:
             data = parent_conn.recv()
-            pre_transition_data["state"].append(data["state"])
+            pre_transition_data["state"].append(data["state"]) # global state
             pre_transition_data["avail_actions"].append(data["avail_actions"])
             pre_transition_data["obs"].append(data["obs"])
+            pre_transition_data["left_attack"].append([np.array([1.0])])
 
         self.batch.update(pre_transition_data, ts=0)
 
         self.t = 0
         self.env_steps_this_run = 0
     
-    
+
     def run(self, mac, test_mode=False):
         self.mac = mac
         self.reset()
@@ -105,32 +114,50 @@ class ParallelRunner:
         terminated = [False for _ in range(self.batch_size)]
         envs_not_terminated = [b_idx for b_idx, termed in enumerate(terminated) if not termed]
         final_env_infos = []  # may store extra stats like battle won. this is filled in ORDER OF TERMINATION
+        attack_cnts = [0 for _ in range(self.batch_size)]
         
-        save_probs = getattr(self.args, "save_probs", False)
+        if test_mode==True:
+            attack_num = self.args.num_attack_test
+        else:
+            attack_num = self.args.num_attack_train
+        
+        # do_attack_num = 0
+        # attack_num_agents = self.args.attack_num_agents
+        # initial_attack_flag = copy.deepcopy(self.args.attack_duration)
+        # save_probs = getattr(self.args, "save_probs", False)
         while True:
+            ori_actions, byzantine_actions, victim_id = self.mac.select_byzantine_actions(self.batch, t_ep=self.t, t_env=self.t_env, bs=envs_not_terminated, test_mode=test_mode)
             
-            if save_probs:
-                actions, probs = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, bs=envs_not_terminated, test_mode=test_mode)
-            else:
-                actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, bs=envs_not_terminated, test_mode=test_mode)
-            
-            cpu_actions = actions.to("cpu").numpy()
-
             # Update the actions taken
             actions_chosen = {
-                "actions": actions.unsqueeze(1).to("cpu"),
+                "actions": ori_actions.unsqueeze(1).to("cpu"), # original actions, not attacked
+                "byzantine_actions": byzantine_actions.unsqueeze(1).to("cpu"), # attacked actions (all)
+                "victim_id": victim_id.to("cpu")
             }
-            if save_probs:
-                actions_chosen["probs"] = probs.unsqueeze(1).to("cpu")
-            
+
             self.batch.update(actions_chosen, bs=envs_not_terminated, ts=self.t, mark_filled=False)
 
+
+
+            # begin replacing actions for attacked agents
+            do_actions = copy.deepcopy(ori_actions)
+            
+            # can attack
+            actual_batch_idx = 0
+            for idx in envs_not_terminated:
+                if attack_cnts[idx] < attack_num: # can attack
+                    attack_agent_id = victim_id[actual_batch_idx].data
+                    if attack_agent_id != self.args.n_agents: # choose agent to attack
+                        attack_cnts[idx] += 1
+                        do_actions[actual_batch_idx][attack_agent_id] = copy.deepcopy(byzantine_actions[actual_batch_idx][attack_agent_id])
+                        actual_batch_idx += 1
+            do_actions = do_actions.to("cpu").numpy()
             # Send actions to each env
             action_idx = 0
             for idx, parent_conn in enumerate(self.parent_conns):
                 if idx in envs_not_terminated: # We produced actions for this env
                     if not terminated[idx]: # Only send the actions to the env if it hasn't terminated
-                        parent_conn.send(("step", cpu_actions[action_idx]))
+                        parent_conn.send(("step", do_actions[action_idx]))
                     action_idx += 1 # actions is not a list over every env
 
             # Update envs_not_terminated
@@ -141,6 +168,8 @@ class ParallelRunner:
 
             # Post step data we will insert for the current timestep
             post_transition_data = {
+                # "actions": ori_actions.to("cpu").numpy(),
+                # "do_actions": do_actions,
                 "reward": [],
                 "terminated": []
             }
@@ -148,7 +177,8 @@ class ParallelRunner:
             pre_transition_data = {
                 "state": [],
                 "avail_actions": [],
-                "obs": []
+                "obs": [],
+                "left_attack": []
             }
 
             # Receive data back for each unterminated env
@@ -175,6 +205,7 @@ class ParallelRunner:
                     pre_transition_data["state"].append(data["state"])
                     pre_transition_data["avail_actions"].append(data["avail_actions"])
                     pre_transition_data["obs"].append(data["obs"])
+                    pre_transition_data["left_attack"].append([(1 - attack_cnts[idx] / attack_num,)])
 
             # Add post_transiton data into the batch
             self.batch.update(post_transition_data, bs=envs_not_terminated, ts=self.t, mark_filled=False)
@@ -219,9 +250,8 @@ class ParallelRunner:
 
         return self.batch
 
-
-
-
+    
+    
     def _log(self, returns, stats, prefix):
         self.logger.log_stat(prefix + "return_mean", np.mean(returns), self.t_env)
         self.logger.log_stat(prefix + "return_std", np.std(returns), self.t_env)

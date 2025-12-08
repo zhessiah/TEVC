@@ -17,6 +17,7 @@ from controllers import REGISTRY as mac_REGISTRY
 from components.episode_buffer import ReplayBuffer
 from components.transforms import OneHot
 from components.Evolver import NN_Evolver, Genome
+from components.attacker import MLPAttacker
 
 from smac.env import StarCraft2Env
 
@@ -28,17 +29,54 @@ def get_agent_own_state_size(env_args):
 
 def rl_to_evo(rl_genome, evo_genome):
     """
-    Transfer parameters from RL Genome to Evolution Genome with exponential moving average.
+    Transfer parameters from RL Genome to Evolution Genome with HARD REPLACEMENT.
     Both Genomes contain two MACs (mac1 and mac2).
+    Direction: RL → Evolution (完全替换，不保留原参数)
+    
+    NOTE: Mixer is NOT transferred (it's not part of Genome anymore).
+    NOTE: This is the legacy single-individual version. 
+    For batch replacement, use rl_to_evo_excluding_pareto() instead.
     """
-    alpha = 0.1
+    # HARD REPLACEMENT: Direct parameter copy (no EMA)
     # Transfer mac1 parameters
     for target_param, param in zip(evo_genome.mac1.agent.parameters(), rl_genome.mac1.agent.parameters()):
-        target_param.data.copy_(alpha * target_param.data + (1 - alpha) * param.data)
+        target_param.data.copy_(param.data)  # Complete replacement
     
     # Transfer mac2 parameters
     for target_param, param in zip(evo_genome.mac2.agent.parameters(), rl_genome.mac2.agent.parameters()):
-        target_param.data.copy_(alpha * target_param.data + (1 - alpha) * param.data)
+        target_param.data.copy_(param.data)  # Complete replacement
+
+
+def rl_to_evo_excluding_elites(rl_genome, population, best_agents):
+    """
+    Transfer RL Genome parameters to ALL population members EXCEPT Pareto first front.
+    This is a HARD REPLACEMENT - completely overwrites inferior individuals with RL parameters.
+    
+    Args:
+        rl_genome: Main RL Genome (source)
+        population: List of evolution Genomes (targets)
+    
+    Direction: RL → Evolution (每次训练后完全替换，不保留原参数)
+    Strategy: Complete parameter copy (no EMA, full replacement)
+    
+    NOTE: Only MACs are transferred. Mixer stays in learner.
+    """
+    for i in range(len(population)):
+        # Skip Pareto first front individuals (elites)
+        if i in best_agents:
+            continue
+        
+        evo_genome = population[i]
+        
+        # HARD REPLACEMENT: Directly copy RL parameters (no EMA, no blending)
+        # Transfer mac1 parameters
+        for target_param, param in zip(evo_genome.mac1.agent.parameters(), rl_genome.mac1.agent.parameters()):
+            target_param.data.copy_(param.data)  # Complete replacement
+        
+        # Transfer mac2 parameters
+        for target_param, param in zip(evo_genome.mac2.agent.parameters(), rl_genome.mac2.agent.parameters()):
+            target_param.data.copy_(param.data)  # Complete replacement
+
 
 def run(_run, _config, _log):
 
@@ -152,17 +190,22 @@ def run_sequential(args, logger):
         "state": {"vshape": env_info["state_shape"]},
         "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
         "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
+        "do_actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
+        "byzantine_actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
+        "victim_id" : {"vshape": (1,), "dtype": th.float32},
         "avail_actions": {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.int},
         "probs": {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.float},
         "reward": {"vshape": (1,)},
         "terminated": {"vshape": (1,), "dtype": th.uint8},
+        "left_attack": {"vshape": (1,), "dtype": th.float32}, 
     }
     groups = {
         "agents": args.n_agents
     }
     preprocess = {
-        "actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])
-    }
+        "actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)]),
+        "do_actions": ("do_actions_onehot", [OneHot(out_dim=args.n_actions)]),
+    }    
 
     buffer = ReplayBuffer(scheme, groups, args.buffer_size, env_info["episode_limit"] + 1,
                           preprocess=preprocess,
@@ -180,10 +223,16 @@ def run_sequential(args, logger):
         # fitness = np.zeros((args.pop_size, 3))
         for i in range(args.pop_size):
             population.append(Genome(args, buffer, groups))
+            
+        population_attackers = []
+        for i in range(args.attacker_pop_size):
+            population_attackers.append(MLPAttacker(args))
         pop_size = args.pop_size
         elite_size = args.elite_size 
+        attacker_pop_size = args.attacker_pop_size
          
         best_agents = list(range(int(pop_size*elite_size)))
+        best_attackers = list(range(int(attacker_pop_size*elite_size)))
     
     else:
         mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
@@ -282,12 +331,18 @@ def run_sequential(args, logger):
         # run with bests of pop
         # fitness = [[] for _ in range(args.pop_size)]
         replace_index = None
-        if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
+        if args.EA and runner.t_env > args.start_timesteps:
             
             with th.no_grad():
                 for i in best_agents:
-                    episode_batch = runner.run(population[i], test_mode=False)
-                    buffer.insert_episode_batch(episode_batch)
+                    if args.adversarial_training:
+                        for j in best_attackers:
+                            population[i].mac1.set_attacker(population_attackers[j])
+                            episode_batch = runner.run(population[i], test_mode=False)
+                            buffer.insert_episode_batch(episode_batch)
+                    else:
+                        episode_batch = runner.run(population[i], test_mode=False)
+                        buffer.insert_episode_batch(episode_batch)
         #  normal run with mac
         # else:
         #     elite_index = [0]
@@ -295,7 +350,12 @@ def run_sequential(args, logger):
         # Normal run with mac (or genome if EA)
         with th.no_grad():
             if args.EA:
-                episode_batch = runner.run(genome, test_mode=False)
+                if args.adversarial_training:
+                    for j in best_attackers:
+                        genome.mac1.set_attacker(population_attackers[j])
+                        episode_batch = runner.run(genome, test_mode=False)
+                else:
+                    episode_batch = runner.run(genome, test_mode=False)
             else:
                 episode_batch = runner.run(mac, test_mode=False)
             buffer.insert_episode_batch(episode_batch)
@@ -322,11 +382,19 @@ def run_sequential(args, logger):
             #     learner.args.robust_regular = False
             info = learner.train(episode_sample, runner.t_env, episode)
             
+            # ========== RL → Population Injection (每次训练后) ==========
+            # After each training step, inject RL knowledge to all non-elite population members
+            # This ensures inferior individuals benefit from RL's gradient-based learning
+            if args.EA and runner.t_env > args.start_timesteps:
+                # Determine which individuals to protect from replacement
+                # Inject RL Genome to all population members EXCEPT best agents
+                rl_to_evo_excluding_elites(genome, population, best_agents)
+                
+
             # Extract TD error from training info (assuming learner returns a dict with TD info)
             # If learner.train() returns the info dict directly
             current_TD = info['td_error']
             # === Learning-Assisted Dynamic Weighting Mechanism ===
-            
             # Step 1: Initialize TD_init from first 50 training steps (only once!)
             if TD_init is None:
                 TD_history.append(current_TD)
@@ -371,9 +439,32 @@ def run_sequential(args, logger):
             
             del episode_sample
             
-            # NSGA begins here
+            # ========== Start Evo ==========
             if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
                 # print('EA starts')
+                
+                # === Step 1: Lamarckian SGD Injection (拉马克微调阶段) ===
+                # 对精英个体进行 SGD 微调，使其快速适应当前环境
+                use_lamarckian_sgd = getattr(args, 'use_lamarckian_sgd', True)  # 默认开启
+                num_finetune_elites = getattr(args, 'num_finetune_elites', 3)  # 微调 Top-K 精英
+                num_sgd_steps = getattr(args, 'lamarckian_sgd_steps', 1)  # SGD 步数
+                
+                if use_lamarckian_sgd:
+                    # 获取当前精英索引
+                    elite_indices_prev = best_agents if hasattr(learner, 'best_agents') else list(range(min(num_finetune_elites, args.pop_size)))
+                    
+                    logger.console_logger.info(f"[Lamarckian SGD] Finetuning Top-{num_finetune_elites} elites with {num_sgd_steps} SGD steps...")
+                    
+                    for elite_idx in best_agents:
+                        # 对精英个体进行 SGD 微调（直接修改其权重）
+                        td_loss = learner.lamarckian_finetune(population[elite_idx], episode_batch, num_sgd_steps)
+                        
+                        if args.use_tensorboard and elite_idx == elite_indices_prev[0]:
+                            logger.log_stat("lamarckian_td_loss", td_loss, runner.t_env)
+                    
+                    logger.console_logger.info(f"[Lamarckian SGD] Completed. Elite {elite_indices_prev[0]} TD Loss: {td_loss:.6f}")
+                
+                # === Step 2: Fitness Evaluation ===
                 # Reset fitness to list of lists for append operations
                 fitness = [[] for _ in range(args.pop_size)]
                 
@@ -384,7 +475,7 @@ def run_sequential(args, logger):
                 
                 # Get current elite indices for population consensus calculation
                 # Use the best agents from previous epoch (if available)
-                elite_indices = learner.best_agents if hasattr(learner, 'best_agents') else list(range(min(3, args.pop_size)))
+                elite_indices = best_agents if hasattr(learner, 'best_agents') else list(range(min(3, args.pop_size)))
                 
                 for i in range(args.pop_size):
                     # === Optimality Metrics (左翼) ===
@@ -440,6 +531,7 @@ def run_sequential(args, logger):
                     f"(Optimality weight: {1-alpha_t:.3f}, Robustness weight: {alpha_t:.3f})"
                 )
                 
+                # === Step 3: Evolutionary Selection (进化选择阶段) ===
                 # Pass alpha_t to evolver for learning-assisted dynamic weighting
                 elite_index, replace_index = evolver.epoch(population, fitness, agent_level=True, alpha_t=alpha_t)
                 best_agents = elite_index
@@ -448,24 +540,22 @@ def run_sequential(args, logger):
                 if use_adversarial_novelty and len(elite_index) > 0:
                     learner.update_elite_archive(elite_index, episode_batch)
                 
-                # print("EA ends.")
-
-        # Execute test runs once in a while
-
-        if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
-            # if args.Pareto:
-            #     fitness = np.array(fitness)
-            #     replace_index = np.argmin(fitness[:, 0]) # replace worst reward
-            # else:
-            #     replace_index = np.argmin(fitness)
-            if replace_index is not None:
-                for i in replace_index:
-                    # prev_state = copy.deepcopy(population[replace_index].mac1.agent.state_dict())
-                    rl_to_evo(genome, population[i]) # replace population[replace_index]'s params with genome's params
-            # if evaluate_new_population(pop) < evaluate_previous_population(prev_state):
-            #     pop[replace_index].mac1.agent.load_state_dict(prev_state)
-            evolver.rl_policy = replace_index
-            # print('Replace bad individuals with RL')
+                logger.console_logger.info(
+                    f"[EA Selection] New generation created. "
+                    f"Elites: {elite_index[:5]}, Replace: {replace_index}"
+                )
+                
+                # === Step 4: Closing the Lamarckian Loop (参数回注阶段) ===
+                
+                # 4a. RL → Evolution: 用 RL 智能体替换最差个体（注入快速学习能力）
+                # NOTE: This step is now handled AFTER EACH TRAINING in the training loop above
+                # We keep this for backward compatibility but it's redundant with the new logic
+                use_rl_injection = getattr(args, 'use_rl_injection', True)  # Disable old logic by default
+                if use_rl_injection and replace_index is not None:
+                    for i in replace_index:
+                        rl_to_evo(genome, population[i])
+                        logger.console_logger.info(f"[RL → Evo (Legacy)] Injected RL Genome into population[{i}]")
+                    evolver.rl_policy = replace_index 
         
         
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
@@ -479,16 +569,16 @@ def run_sequential(args, logger):
             last_test_T = runner.t_env
             
             # if (args.test_attack and runner.t_env >= args.t_max // 3 and runner.t_env <= args.t_max // 3 * 2): # attack during the second third of the training
-            if (args.all_test_attack):
-                runner.set_perturb(True) 
-            elif (args.test_attack and runner.t_env >= args.t_max // 3 and runner.t_env <= args.t_max // 3 * 2): # attack during the second third of the training
-                runner.set_perturb(True)
+            # if (args.all_test_attack):
+            #     runner.set_perturb(True) 
+            # elif (args.test_attack and runner.t_env >= args.t_max // 3 and runner.t_env <= args.t_max // 3 * 2): # attack during the second third of the training
+            #     runner.set_perturb(True)
             for _ in range(n_test_runs):
                 if args.EA:
                     runner.run(genome, test_mode=True)
                 else:
                     runner.run(mac, test_mode=True)
-            runner.set_perturb(False)
+            # runner.set_perturb(False)
         
             # Replace bad individuals with mac
         
