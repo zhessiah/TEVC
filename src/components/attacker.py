@@ -47,7 +47,6 @@ class MLPAttacker(nn.Module):
         # Buffer will be set externally via setup_buffer()
         self.buffer = None
         self.soft_tau = args.attacker_soft_tau
-        self.to(args.device)
     
     @property
     def target_net(self):

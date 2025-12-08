@@ -135,6 +135,7 @@ gpu_id: 0
 attack_num: 6
 test_attack_num: 6
 fine_tune: False
+pop_size: 4
 run_type: "robust" # robust, attack, attack_na, robust_na, eval_na
 test_attacker_archive_path: ""
 diversity: True
@@ -147,9 +148,140 @@ attacker_soft_tau: 0.005
 attack_agent_selector: "sparse"
 adversarial_training: True
 num_attack_train: 12
-num_attack_test: 12
 attack_mode: "action"
+
+
+# ========================================================================
+# Multi-Objective Evolutionary Adversarial Training (MOEA-AAG)
+# ========================================================================
+# This section configures the adversarial training system using 
+# Multi-Objective Evolutionary Algorithms (MOEA) with NSGA-II.
+#
+# Key Features:
+# 1. Three-objective optimization: Damage, Cost, Diversity
+# 2. Pareto-based selection (no hyperparameter tuning for α, β)
+# 3. Implicit curriculum learning (automatic difficulty adjustment)
+# 4. Behavioral diversity (corner case coverage)
+#
+# Advantages over ROMANCE/WALL:
+# - No manual hyperparameter tuning (α, β weights)
+# - Automatic difficulty curriculum (based on Pareto front evolution)
+# - Comprehensive attack coverage (entire Pareto front, not single point)
+# - Mode collapse prevention (diversity objective + behavioral archive)
+# ========================================================================
+
 # --- Core Adversarial Training Switch ---
-attacker_pop_size: 20               
+use_adversarial_training: False         # Enable MOEA-based adversarial training
+                                        # Set to True to activate co-evolution
+
+# --- Attacker Population Settings ---
+attacker_pop_size: 20                   # Attacker population size (N attackers)
+                                        # Larger = more diverse attacks, but more computation
+                                        # Recommended: 15-30 for SMAC environments
+
+attacker_elite_fraction: 0.2            # Fraction of population in Pareto front to preserve
+                                        # 0.2 means top 20% (4 attackers if pop=20)
+                                        # This ensures best attackers survive evolution
+
+# --- NSGA-II Evolutionary Parameters ---
+attacker_mutation_prob: 0.9             # Probability of mutation per offspring
+                                        # High value (0.8-0.95) recommended for exploration
+
+attacker_crossover_prob: 0.9            # Probability of crossover when generating offspring
+                                        # High value ensures parameter mixing
+
+attacker_tournament_size: 3             # Tournament size for selection
+                                        # 3 is standard for NSGA-II
+
+# --- Lamarckian Gradient Mutation (Key Innovation!) ---
+attacker_use_lamarckian: True           # Enable gradient-based mutation
+                                        # This is the key feature combining EA + RL
+                                        # Attackers learn to attack current defender via SGD
+
+attacker_lamarckian_lr: 0.001           # Learning rate for Lamarckian mutation
+                                        # Conservative value to avoid overfitting
+
+attacker_lamarckian_steps: 5            # Number of gradient steps per mutation
+                                        # More steps = stronger adaptation to defender
+                                        # 3-10 recommended
+
+# --- Behavioral Diversity Archive (Quality-Diversity) ---
+attacker_archive_size: 50               # Maximum size of behavioral archive
+                                        # Stores behavioral descriptors for novelty search
+                                        # Larger = better diversity tracking, more memory
+
+# --- Attack Budget and Sparsity ---
+epsilon: 0.2                            # L_inf perturbation budget (attack strength)
+                                        # 0.1-0.3 typical for observation perturbations
+                                        # Higher = stronger attacks, less stealthy
+
+attacker_sparsity_target: 0.3           # Target attack frequency (1 - sparsity)
+                                        # 0.3 means attack 30% of timesteps
+                                        # Lower = more stealthy, higher = more aggressive
+                                        # This is f2 (cost) objective target
+
+# --- Attacker Evaluation ---
+attacker_eval_episodes: 5               # Episodes to evaluate each attacker's fitness
+                                        # More = more accurate fitness, slower evolution
+                                        # 3-10 recommended
+
+# --- Training Schedule and Curriculum ---
+adversarial_warmup_steps: 50000         # Timesteps before attackers are introduced
+                                        # Defender learns basic policy first
+                                        # Recommended: 10-20% of t_max
+
+attacker_evolution_freq: 100            # Evolve attacker population every N episodes
+                                        # Lower = attackers adapt faster, more computation
+                                        # 50-200 recommended
+
+defender_training_freq: 1               # Train defender every N episodes
+                                        # Usually 1 (train every episode)
+
+use_implicit_curriculum: True           # Enable automatic difficulty adjustment
+                                        # Attack probability increases with training progress
+                                        # Key feature for implicit curriculum learning
+
+max_attack_probability: 0.5             # Maximum probability of using attacks during training
+                                        # 0.5 means 50% clean episodes, 50% adversarial
+                                        # Balance between clean and robust training
+
+# --- Attack Diversity Sampling ---
+# During defender training, we sample diverse attackers from Pareto front:
+# - Best damage attacker (strongest)
+# - Best sparsity attacker (stealthiest)  
+# - Best diversity attacker (most novel)
+# This ensures defender sees different attack types, not just strongest
+
+# --- Observation Space Constraints (optional) ---
+# obs_clip_min: -10.0                   # Minimum valid observation value
+# obs_clip_max: 10.0                    # Maximum valid observation value
+                                        # Uncomment if environment has observation bounds
+
+# --- Computational Budget ---
+# Total computation per attacker evolution:
+#   attacker_pop_size × attacker_eval_episodes × episode_length
+# Example: 20 × 5 × 100 = 10,000 timesteps per evolution
+# If attacker_evolution_freq = 100 episodes, this is 10% overhead
+# Adjust attacker_pop_size and attacker_eval_episodes to control computation
+
+# --- Recommended Configurations ---
+#
+# Configuration 1: Basic (Fast, Low Computation)
+# - attacker_pop_size: 10
+# - attacker_eval_episodes: 3
+# - attacker_evolution_freq: 200
+# - Use for quick experiments and debugging
+#
+# Configuration 2: Standard (Balanced)
+# - attacker_pop_size: 20
+# - attacker_eval_episodes: 5
+# - attacker_evolution_freq: 100
+# - Use for most SMAC environments
+#
+# Configuration 3: Complete (High Quality, High Computation)
+# - attacker_pop_size: 30
+# - attacker_eval_episodes: 10
+# - attacker_evolution_freq: 50
+# - Use for final experiments and paper results
 
 name: "EvoQ_env=8_adam_td_lambda"
