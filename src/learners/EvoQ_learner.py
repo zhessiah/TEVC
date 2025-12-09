@@ -1148,3 +1148,306 @@ class EvoQLearner:
         if self.mixer is not None:
             self.mixer.load_state_dict(th.load("{}/mixer.th".format(path), map_location=lambda storage, loc: storage))
         self.optimiser.load_state_dict(th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage))
+
+    # ========== Attacker Fitness Calculation ==========
+    def calculate_attacker_quality(self, batch, attacker_idx, population_attackers):
+        """
+        Calculate attack quality: negative mean episode return (lower defender reward = better).
+        
+        Args:
+            batch: Episode batch data
+            attacker_idx: Index of attacker in population
+            population_attackers: List of all attacker instances
+            
+        Returns:
+            mean_return: Mean episode return (scalar tensor)
+        """
+        # Extract rewards from batch
+        rewards = batch["reward"][:, :-1]  # [batch_size, T, 1]
+        mask = batch["filled"][:, :-1].float()  # [batch_size, T, 1]
+        
+        # Compute episode returns
+        episode_returns = (rewards * mask).sum(dim=1) / mask.sum(dim=1)  # [batch_size, 1]
+        mean_return = episode_returns.mean()
+        
+        return mean_return
+    
+    def calculate_attacker_efficiency(self, batch, attacker_idx, population_attackers):
+        """
+        Calculate attack efficiency: mean attack count (lower is more efficient).
+        
+        Args:
+            batch: Episode batch data
+            attacker_idx: Index of attacker in population
+            population_attackers: List of all attacker instances
+            
+        Returns:
+            mean_attack_count: Mean number of attacks used (scalar tensor)
+        """
+        # Extract attack budget usage from batch
+        # Assuming "left_attack" tracks remaining budget (initial - used)
+        left_attack = batch["left_attack"][:, :-1]  # [batch_size, T, 1]
+        mask = batch["filled"][:, :-1].float()
+        
+        # Compute attacks used = initial_budget - min(left_attack)
+        # Assuming initial budget is stored in args
+        initial_budget = self.args.num_attack_train
+        
+        # Get minimum remaining budget per episode (final budget)
+        final_budget = left_attack[:, -1]  # [batch_size, 1]
+        attacks_used = initial_budget - final_budget  # [batch_size, 1]
+        
+        mean_attack_count = attacks_used.mean()
+        
+        return mean_attack_count
+
+    # ========== Attacker Novelty Calculation ==========
+    def calculate_attacker_behavioral_novelty(self, batch, attacker_idx, elite_attackers, population_attackers):
+        """
+        Calculate behavioral novelty of an attacker compared to elite archive.
+        
+        Behavioral Characterization:
+        - Victim selection pattern: distribution of which agents are targeted
+        - Attack timing: when attacks occur in the episode
+        - Attack efficiency: coverage vs budget usage
+        
+        Args:
+            batch: Episode batch data
+            attacker_idx: Index of current attacker in population
+            elite_attackers: Indices of elite attackers (archive)
+            population_attackers: List of all attacker instances
+            
+        Returns:
+            novelty_score: Average behavioral distance to elite archive
+        """
+        if len(elite_attackers) == 0:
+            # No archive yet, maximum novelty
+            return th.tensor(1.0, device=self.device)
+        
+        current_attacker = population_attackers[attacker_idx]
+        current_attacker.eval()
+        
+        # Extract behavioral features for current attacker
+        current_behavior = self._extract_attacker_behavior(batch, current_attacker)
+        
+        # Compute behavioral distance to each elite
+        distances = []
+        for elite_idx in elite_attackers:
+            if elite_idx == attacker_idx:
+                continue  # Skip self-comparison
+            
+            elite_attacker = population_attackers[elite_idx]
+            elite_attacker.eval()
+            
+            elite_behavior = self._extract_attacker_behavior(batch, elite_attacker)
+            
+            # Compute behavioral distance (L2 norm in behavior space)
+            distance = self._behavioral_distance(current_behavior, elite_behavior)
+            distances.append(distance)
+        
+        if len(distances) == 0:
+            return th.tensor(1.0, device=self.device)
+        
+        # Novelty = average distance to k-nearest neighbors (k=min(3, len(archive)))
+        k = min(3, len(distances))
+        distances_tensor = th.tensor(distances, device=self.device)
+        topk_distances = th.topk(distances_tensor, k, largest=False).values
+        novelty_score = th.mean(topk_distances)
+        
+        return novelty_score
+    
+    def _extract_attacker_behavior(self, batch, attacker):
+        """
+        Extract behavioral characterization of an attacker.
+        
+        Returns:
+            behavior_vector: Dictionary containing:
+                - victim_distribution: (n_agents+1,) distribution over victim choices
+                - attack_timing: (time_bins,) distribution of when attacks occur
+                - victim_entropy: Entropy of victim selection (diversity measure)
+        """
+        with th.no_grad():
+            # Get victim selections across the batch
+            victim_ids_list = []
+            attack_q_values_list = []
+            
+            for t in range(batch.max_seq_length - 1):
+                attacker_q = attacker.batch_forward(batch, t=t)  # (bs, n_agents+1)
+                victim_id = th.argmax(attacker_q, dim=-1)  # (bs,) greedy selection
+                
+                victim_ids_list.append(victim_id)
+                attack_q_values_list.append(attacker_q)
+            
+            victim_ids = th.stack(victim_ids_list, dim=1)  # (bs, seq_len-1)
+            attack_q_values = th.stack(attack_q_values_list, dim=1)  # (bs, seq_len-1, n_agents+1)
+            
+            # Feature 1: Victim selection distribution
+            victim_distribution = th.zeros(self.args.n_agents + 1, device=self.device)
+            for i in range(self.args.n_agents + 1):
+                victim_distribution[i] = (victim_ids == i).float().mean()
+            
+            # Feature 2: Attack timing distribution (early, mid, late episode)
+            time_bins = 3
+            seq_len = victim_ids.shape[1]
+            attack_timing = th.zeros(time_bins, device=self.device)
+            
+            for bin_idx in range(time_bins):
+                start_t = (seq_len * bin_idx) // time_bins
+                end_t = (seq_len * (bin_idx + 1)) // time_bins
+                
+                # Count non-"no-attack" choices in this time bin
+                bin_victims = victim_ids[:, start_t:end_t]
+                attacks_in_bin = (bin_victims != self.args.n_agents).float().mean()
+                attack_timing[bin_idx] = attacks_in_bin
+            
+            # Feature 3: Victim entropy (diversity of targeting)
+            victim_probs = victim_distribution + 1e-8  # Add epsilon for stability
+            victim_probs = victim_probs / victim_probs.sum()  # Normalize
+            victim_entropy = -(victim_probs * th.log(victim_probs)).sum()
+            
+            # Combine into behavior vector
+            behavior_vector = {
+                'victim_distribution': victim_distribution,  # (n_agents+1,)
+                'attack_timing': attack_timing,  # (time_bins,)
+                'victim_entropy': victim_entropy.unsqueeze(0),  # (1,)
+            }
+            
+            return behavior_vector
+    
+    def _behavioral_distance(self, behavior1, behavior2):
+        """
+        Compute distance between two behavioral characterizations.
+        
+        Uses weighted Euclidean distance across different behavior features.
+        """
+        # Weight different features
+        w_victim = 1.0  # Victim selection pattern
+        w_timing = 0.5  # Attack timing
+        w_entropy = 0.3  # Victim diversity
+        
+        # Distance in victim selection space
+        dist_victim = th.norm(behavior1['victim_distribution'] - behavior2['victim_distribution'], p=2)
+        
+        # Distance in attack timing space
+        dist_timing = th.norm(behavior1['attack_timing'] - behavior2['attack_timing'], p=2)
+        
+        # Distance in entropy (scalar)
+        dist_entropy = th.abs(behavior1['victim_entropy'] - behavior2['victim_entropy']).squeeze()
+        
+        # Weighted combination
+        total_distance = (w_victim * dist_victim + 
+                         w_timing * dist_timing + 
+                         w_entropy * dist_entropy)
+        
+        return total_distance.item()
+    
+    # ========== Attacker Lamarckian SGD Finetuning ==========
+    def lamarckian_finetune_attacker(self, attacker, episode_batch, num_sgd_steps=1):
+        """
+        Lamarckian SGD微调for Attacker: 沿着quality目标(negative defender reward)进行梯度下降。
+        
+        与defender的Lamarckian不同:
+        - Defender优化: 最小化TD error (拟合环境)
+        - Attacker优化: 最大化negative reward (破坏defender性能)
+        
+        训练目标:
+        1. 主要: 最小化 defender reward (即最大化 -reward)
+        2. 辅助: 保持Soft Q-Learning的策略稀疏性
+        
+        Args:
+            attacker: MLPAttacker instance to finetune
+            episode_batch: Recent episode batch for computing gradient
+            num_sgd_steps: Number of SGD steps to perform
+            
+        Returns:
+            final_loss: Final quality loss value (for monitoring)
+        """
+        # 1. 设置为训练模式
+        attacker.train()
+        
+        # 2. 创建临时优化器 (使用较小学习率，避免破坏进化得到的权重)
+        finetune_lr = getattr(self.args, 'attacker_finetune_lr', self.args.attack_lr * 0.1)
+        finetune_optimizer = th.optim.RMSprop(
+            attacker.parameters(), 
+            lr=finetune_lr,
+            alpha=self.args.optim_alpha, 
+            eps=self.args.optim_eps
+        )
+        
+        # 准备batch
+        max_ep_t = episode_batch.max_t_filled()
+        batch = episode_batch[:, :max_ep_t]
+        
+        if batch.device != self.args.device:
+            batch.to(self.args.device)
+        
+        # 提取数据
+        rewards = batch["reward"][:, :-1]  # Defender's reward
+        # if self.args.shaping_reward:
+        #     rewards = batch["shaping_reward"][:, :-1]
+        
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        
+        # 3. 执行多步SGD微调
+        for step in range(num_sgd_steps):
+            # Forward pass: 计算attacker的Q值
+            attacker_qs = []
+            for t in range(batch.max_seq_length):
+                attacker_q = attacker.batch_forward(batch, t=t)
+                attacker_qs.append(attacker_q)
+            attacker_qs = th.stack(attacker_qs, dim=1)  # (bs, seq_len, n_agents+1)
+            
+            # === Quality Objective: Maximize negative defender reward ===
+            # 策略: 选择能最大化负reward的victim
+            # 使用softmax得到victim选择概率分布
+            victim_logits = attacker_qs[:, :-1]  # (bs, seq_len-1, n_agents+1)
+            victim_probs = th.softmax(victim_logits, dim=-1)  # Temperature=0.1 for sharper distribution
+            
+            # 计算期望的victim选择下的reward
+            # 假设: 选择不同victim会导致不同的reward
+            # 简化为: 最大化选择"攻击"行为(非no-attack)的概率
+            attack_prob = 1.0 - victim_probs[:, :, -1]  # Probability of NOT choosing "no-attack"
+            
+            # Quality loss: 最小化defender reward，加权于攻击概率
+            # L_quality = E[reward * attack_prob] = 期望的defender损失
+            quality_loss = -(rewards.squeeze(-1) * attack_prob * mask.squeeze(-1)).sum() / mask.sum()
+            
+            # === Regularization: Soft Q-Learning稀疏性约束 ===
+            # 保持与p_ref的一致性，防止过度偏离稀疏攻击策略
+            # KL散度: D_KL(victim_probs || p_ref)
+            p_ref_expanded = attacker.p_ref.unsqueeze(0).unsqueeze(0).expand_as(victim_probs)
+            kl_div = (victim_probs * (th.log(victim_probs + 1e-8) - th.log(p_ref_expanded + 1e-8))).sum(dim=-1)
+            
+            reg_weight = getattr(self.args, 'attacker_finetune_reg', 0.01)
+            reg_loss = (kl_div * mask.squeeze(-1)).sum() / (mask.sum() + 1e-8)
+            
+            # Total loss
+            total_loss = quality_loss + reg_weight * reg_loss
+            
+            # 检查loss是否合理
+            if not th.isfinite(total_loss):
+                # Loss异常，停止微调
+                return float('inf')
+            
+            # Backward and optimize
+            finetune_optimizer.zero_grad()
+            total_loss.backward()
+            
+            # 梯度裁剪 (更保守)
+            grad_clip = getattr(self.args, 'attacker_finetune_grad_clip', self.args.grad_norm_clip * 0.5)
+            grad_norm = th.nn.utils.clip_grad_norm_(attacker.parameters(), grad_clip)
+            
+            # 检查梯度
+            if not th.isfinite(grad_norm):
+                finetune_optimizer.zero_grad()
+                return float('inf')
+            
+            finetune_optimizer.step()
+        
+        # 4. 设置回eval模式
+        attacker.eval()
+        
+        # 5. 返回最终loss (主要是quality loss)
+        return quality_loss.item()

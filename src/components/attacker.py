@@ -47,6 +47,7 @@ class MLPAttacker(nn.Module):
         # Buffer will be set externally via setup_buffer()
         self.buffer = None
         self.soft_tau = args.attacker_soft_tau
+        self.to(self.args.device)
     
     @property
     def target_net(self):
@@ -92,91 +93,91 @@ class MLPAttacker(nn.Module):
             raise RuntimeError("Buffer not initialized. Call setup_buffer() first.")
         self.buffer.insert_episode_batch(episode_batch)
     
-    def train(self, logger=None, log_step=None):
-        """
-        Train the attacker using Soft Q-Learning.
+    # def train(self, logger=None, log_step=None):
+    #     """
+    #     Train the attacker using Soft Q-Learning.
         
-        Args:
-            logger: Optional logger for logging training statistics
-            log_step: Optional step number for logging
+    #     Args:
+    #         logger: Optional logger for logging training statistics
+    #         log_step: Optional step number for logging
             
-        Returns:
-            bool: True if training succeeded, False if failed (e.g., NaN gradients)
-        """
-        # Check if buffer is ready
-        if self.buffer is None:
-            raise RuntimeError("Buffer not initialized. Call setup_buffer() first.")
+    #     Returns:
+    #         bool: True if training succeeded, False if failed (e.g., NaN gradients)
+    #     """
+    #     # Check if buffer is ready
+    #     if self.buffer is None:
+    #         raise RuntimeError("Buffer not initialized. Call setup_buffer() first.")
         
-        if not self.buffer.can_sample(self.args.attack_batch_size):
-            return True  # Not an error, just not enough samples yet
+    #     if not self.buffer.can_sample(self.args.attack_batch_size):
+    #         return True  # Not an error, just not enough samples yet
         
-        # Sample batch
-        batch = self.buffer.sample(self.args.attack_batch_size)
-        max_ep_t = batch.max_t_filled()
-        batch = batch[:, :max_ep_t]
+    #     # Sample batch
+    #     batch = self.buffer.sample(self.args.attack_batch_size)
+    #     max_ep_t = batch.max_t_filled()
+    #     batch = batch[:, :max_ep_t]
         
-        # Move to device if needed
-        if batch.device != self.args.device:
-            batch.to(self.args.device)
+    #     # Move to device if needed
+    #     if batch.device != self.args.device:
+    #         batch.to(self.args.device)
         
-        # Extract components
-        rewards = batch["reward"][:, :-1]
-        if self.args.shaping_reward:
-            rewards = batch["shaping_reward"][:, :-1]
-        actions = batch["action"][:, :-1]  # batch_size, max_seq_length-1, 1
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["terminated"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+    #     # Extract components
+    #     rewards = batch["reward"][:, :-1]
+    #     if self.args.shaping_reward:
+    #         rewards = batch["shaping_reward"][:, :-1]
+    #     actions = batch["action"][:, :-1]  # batch_size, max_seq_length-1, 1
+    #     terminated = batch["terminated"][:, :-1].float()
+    #     mask = batch["terminated"][:, :-1].float()
+    #     mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         
-        # Compute Q-values for current states
-        attacker_qs = []
-        for t in range(batch.max_seq_length):
-            attacker_q = self.batch_forward(batch, t=t)
-            attacker_qs.append(attacker_q)
-        attacker_qs = th.stack(attacker_qs, dim=1)  # batch_size, max_seq_length, ac_dim~n_agent+1
-        chosen_action_qvals = th.gather(attacker_qs[:, :-1], dim=-1, index=actions)
-        # (batch_size, max_seq_length-1, 1)
+    #     # Compute Q-values for current states
+    #     attacker_qs = []
+    #     for t in range(batch.max_seq_length):
+    #         attacker_q = self.batch_forward(batch, t=t)
+    #         attacker_qs.append(attacker_q)
+    #     attacker_qs = th.stack(attacker_qs, dim=1)  # batch_size, max_seq_length, ac_dim~n_agent+1
+    #     chosen_action_qvals = th.gather(attacker_qs[:, :-1], dim=-1, index=actions)
+    #     # (batch_size, max_seq_length-1, 1)
         
-        # Compute target Q-values using target network
-        targeted_attacker_qs = []
-        for t in range(batch.max_seq_length):
-            targeted_attacker_q = self.target_net.batch_forward(batch, t=t)
-            targeted_attacker_qs.append(targeted_attacker_q)
-        targeted_attacker_qs = th.stack(targeted_attacker_qs[1:], dim=1)
-        # batch_size, max_seq_length-1, ac_dim~n_agent+1
+    #     # Compute target Q-values using target network
+    #     targeted_attacker_qs = []
+    #     for t in range(batch.max_seq_length):
+    #         targeted_attacker_q = self.target_net.batch_forward(batch, t=t)
+    #         targeted_attacker_qs.append(targeted_attacker_q)
+    #     targeted_attacker_qs = th.stack(targeted_attacker_qs[1:], dim=1)
+    #     # batch_size, max_seq_length-1, ac_dim~n_agent+1
         
-        # Soft Q-Learning target: y = r + gamma * lambda * log(E_pref(a')[exp(Q(s',a')/lambda)])
-        lamb = self.lamb
-        targeted_attacker_q = lamb * th.log(
-            (th.exp(targeted_attacker_qs/lamb) * self.p_ref).sum(dim=2)
-        ).unsqueeze(2)
-        targets = rewards + self.args.gamma * (1-terminated) * targeted_attacker_q
+    #     # Soft Q-Learning target: y = r + gamma * lambda * log(E_pref(a')[exp(Q(s',a')/lambda)])
+    #     lamb = self.lamb
+    #     targeted_attacker_q = lamb * th.log(
+    #         (th.exp(targeted_attacker_qs/lamb) * self.p_ref).sum(dim=2)
+    #     ).unsqueeze(2)
+    #     targets = rewards + self.args.gamma * (1-terminated) * targeted_attacker_q
         
-        # Compute TD-error and loss
-        td_error = (chosen_action_qvals - targets.detach())
-        mask = mask.expand_as(td_error)
-        masked_td_error = td_error * mask
-        loss = (masked_td_error ** 2).sum() / mask.sum()
+    #     # Compute TD-error and loss
+    #     td_error = (chosen_action_qvals - targets.detach())
+    #     mask = mask.expand_as(td_error)
+    #     masked_td_error = td_error * mask
+    #     loss = (masked_td_error ** 2).sum() / mask.sum()
         
-        # Optimize
-        self.optimiser.zero_grad()
-        loss.backward()
-        grad_norm = th.nn.utils.clip_grad_norm_(self.parameters(), self.args.grad_norm_clip)
+    #     # Optimize
+    #     self.optimiser.zero_grad()
+    #     loss.backward()
+    #     grad_norm = th.nn.utils.clip_grad_norm_(self.parameters(), self.args.grad_norm_clip)
         
-        # Check for NaN gradients
-        if th.any(th.isnan(grad_norm)):
-            print(f"Warning: NaN gradients detected in attacker training!")
-            return False
+    #     # Check for NaN gradients
+    #     if th.any(th.isnan(grad_norm)):
+    #         print(f"Warning: NaN gradients detected in attacker training!")
+    #         return False
         
-        self.optimiser.step()
-        self.soft_update_target()
+    #     self.optimiser.step()
+    #     self.soft_update_target()
         
-        # Log statistics if logger provided
-        if logger is not None and log_step is not None:
-            logger.log_stat("attacker_quality_loss", loss.item(), log_step)
-            logger.log_stat("attacker_grad_norm", grad_norm.item(), log_step)
+    #     # Log statistics if logger provided
+    #     if logger is not None and log_step is not None:
+    #         logger.log_stat("attacker_quality_loss", loss.item(), log_step)
+    #         logger.log_stat("attacker_grad_norm", grad_norm.item(), log_step)
         
-        return True
+    #     return True
 
 
 class Population:

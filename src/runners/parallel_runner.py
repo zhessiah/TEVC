@@ -217,7 +217,15 @@ class ParallelRunner:
                 self.logger.log_stat("epsilon", self.mac.action_selector.epsilon, self.t_env)
             self.log_train_stats_t = self.t_env
 
-        return self.batch
+        # Return empty attacker_stats for compatibility with parallel_runner_robust
+        attacker_stats = {
+            'mean_return': 0.0,
+            'attack_counts': [],
+            'mean_attack_count': 0.0,
+            'episode_lengths': [],
+        }
+        
+        return self.batch, attacker_stats
 
 
 

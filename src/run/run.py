@@ -163,7 +163,7 @@ def run(_run, _config, _log):
 def evaluate_sequential(mac, args, runner):
 
     for _ in range(args.test_nepisode):
-        runner.run(mac, test_mode=True)
+        _, _ = runner.run(mac, test_mode=True)  # Unpack tuple, ignore attacker_stats
 
     if args.save_replay:
         runner.save_replay()
@@ -212,6 +212,9 @@ def run_sequential(args, logger):
                           device="cpu" if args.buffer_cpu_only else args.device)
     
     evolver = NN_Evolver(args)
+    
+    # Create a separate evolver for attackers with same configuration
+    attacker_evolver = NN_Evolver(args) if args.EA and args.adversarial_training else None
 
     # Setup populations of multiagent controller here
     if args.EA:
@@ -556,6 +559,75 @@ def run_sequential(args, logger):
                         rl_to_evo(genome, population[i])
                         logger.console_logger.info(f"[RL → Evo (Legacy)] Injected RL Genome into population[{i}]")
                     evolver.rl_policy = replace_index 
+                
+                # ========== Attacker Evolution (Co-evolution) ==========
+                if args.adversarial_training:
+                    logger.console_logger.info("[Attacker Evolution] Starting attacker population evolution...")
+                    
+                    # === Step 1: Lamarckian SGD for Elite Attackers ===
+                    use_attacker_lamarckian = getattr(args, 'use_attacker_lamarckian_sgd', True)
+                    num_finetune_attackers = getattr(args, 'num_finetune_attackers', 3)
+                    attacker_sgd_steps = getattr(args, 'attacker_lamarckian_sgd_steps', 1)
+                    
+                    if use_attacker_lamarckian:
+                        logger.console_logger.info(
+                            f"[Attacker Lamarckian SGD] Finetuning Top-{num_finetune_attackers} "
+                            f"elite attackers with {attacker_sgd_steps} SGD steps..."
+                        )
+                        
+                        for attacker_idx in best_attackers[:num_finetune_attackers]:
+                            # 微调该attacker以最大化negative defender reward
+                            quality_loss = learner.lamarckian_finetune_attacker(
+                                population_attackers[attacker_idx], 
+                                episode_batch, 
+                                attacker_sgd_steps
+                            )
+                            
+                            if args.use_tensorboard and attacker_idx == best_attackers[0]:
+                                logger.log_stat("attacker_lamarckian_quality_loss", quality_loss, runner.t_env)
+                        
+                        logger.console_logger.info(
+                            f"[Attacker Lamarckian SGD] Completed. "
+                            f"Elite {best_attackers[0]} Quality Loss: {quality_loss:.6f}"
+                        )
+                    
+                    # === Step 2: Calculate attacker fitness (Simple pattern like Genome fitness) ===
+                    attacker_fitness = [[] for _ in range(args.attacker_pop_size)]
+                    
+                    for i in range(args.attacker_pop_size):
+                        # Fitness 1: Quality - negative mean return (lower defender reward = better attacker)
+                        quality = learner.calculate_attacker_quality(episode_batch, i, population_attackers)
+                        attacker_fitness[i].append(-quality.cpu().numpy())
+                        
+                        # Fitness 2: Efficiency - negative attack frequency
+                        efficiency = learner.calculate_attacker_efficiency(episode_batch, i, population_attackers)
+                        attacker_fitness[i].append(-efficiency.cpu().numpy())
+                        
+                        # Fitness 3: Diversity - behavioral novelty
+                        novelty = learner.calculate_attacker_behavioral_novelty(
+                            episode_batch, i, best_attackers, population_attackers
+                        )
+                        attacker_fitness[i].append(novelty.cpu().numpy())
+                    
+                    # === Step 3: Evolutionary selection for attackers ===
+                    # Use same alpha_t as defenders for consistency (optional: could use different schedule)
+                    attacker_elite_index, attacker_replace_index = attacker_evolver.epoch(
+                        population_attackers, attacker_fitness, agent_level=True, alpha_t=alpha_t
+                    )
+                    best_attackers = attacker_elite_index
+                    
+                    logger.console_logger.info(
+                        f"[Attacker Evolution] New attacker generation created. "
+                        f"Elites: {attacker_elite_index[:5]}, Replace: {attacker_replace_index[:5] if len(attacker_replace_index) > 0 else []}"
+                    )
+                    
+                    # Log attacker fitness statistics
+                    if args.use_tensorboard:
+                        for i in range(min(3, args.attacker_pop_size)):  # Log top 3 attackers
+                            if i < len(attacker_fitness):
+                                logger.log_stat(f"attacker_{i}_quality", attacker_fitness[i][0], runner.t_env)
+                                logger.log_stat(f"attacker_{i}_efficiency", attacker_fitness[i][1], runner.t_env)
+                                logger.log_stat(f"attacker_{i}_novelty", attacker_fitness[i][2], runner.t_env) 
         
         
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
@@ -578,9 +650,7 @@ def run_sequential(args, logger):
                     runner.run(genome, test_mode=True)
                 else:
                     runner.run(mac, test_mode=True)
-            # runner.set_perturb(False)
-        
-            # Replace bad individuals with mac
+
         
 
 

@@ -81,9 +81,8 @@ pr_dim: 64  # default setting
 EA_alpha: 1.0  # default setting
 Org_alpha: 1.0 # default setting
 N_type: 1 # default setting
-# SAME: 1  # default setting
-start_timesteps: 100000 # 50000, 1 for test, 5000000 for not enable evolution
-EA_freq : 20  # 50 default setting, 1 for test
+start_timesteps: 1 # 50000, 1 for test, 5000000 for not enable evolution
+EA_freq : 1  # 50 default setting, 1 for test
 state_alpha: 0.2   # 0.1 beta control VMM, see paper for details
 rl_replace_ea_synch_period: 1
 
