@@ -103,14 +103,14 @@ def run(_run, _config, _log):
         
         if args.EA:
             tb_logs_direc = os.path.join(tb_logs_direc, "EA")
-        if args.training_attack:
-            tb_logs_direc = os.path.join(tb_logs_direc, "train_attack")
-        elif args.test_attack:
-            tb_logs_direc = os.path.join(tb_logs_direc, "test_attack")
-        elif args.all_test_attack:
-            tb_logs_direc = os.path.join(tb_logs_direc, "all_test_attack")
-        else:
-            tb_logs_direc = os.path.join(tb_logs_direc, "no_attack")
+        if args.adversarial_training:
+            tb_logs_direc = os.path.join(tb_logs_direc, "adversarial_training")
+        # elif args.test_attack:
+        #     tb_logs_direc = os.path.join(tb_logs_direc, "test_attack")
+        # elif args.all_test_attack:
+        #     tb_logs_direc = os.path.join(tb_logs_direc, "all_test_attack")
+        # else:
+        #     tb_logs_direc = os.path.join(tb_logs_direc, "no_attack")
         
         
         if "sc2" in args.env or "gfootball" in args.env:
@@ -123,16 +123,16 @@ def run(_run, _config, _log):
             tb_logs_direc = os.path.join(tb_logs_direc, args.env)
             
             
-        tb_logs_direc = os.path.join(tb_logs_direc, "epsilon_{}".format(args.epsilon))
+        # tb_logs_direc = os.path.join(tb_logs_direc, "epsilon_{}".format(args.epsilon))
         
-        if args.pareto:
-            tb_logs_direc = os.path.join(tb_logs_direc, "pareto")
-        elif args.robust_regular:
-            tb_logs_direc = os.path.join(tb_logs_direc, "robust_regular")
-            tb_logs_direc = os.path.join(tb_logs_direc, str(args.robust_lambda))
-        elif args.diff_regular:
-            tb_logs_direc = os.path.join(tb_logs_direc, "diff_regular")
-            tb_logs_direc = os.path.join(tb_logs_direc, str(args.robust_lambda))
+        # if args.pareto:
+        #     tb_logs_direc = os.path.join(tb_logs_direc, "pareto")
+        # elif args.robust_regular:
+        #     tb_logs_direc = os.path.join(tb_logs_direc, "robust_regular")
+        #     tb_logs_direc = os.path.join(tb_logs_direc, str(args.robust_lambda))
+        # elif args.diff_regular:
+        #     tb_logs_direc = os.path.join(tb_logs_direc, "diff_regular")
+        #     tb_logs_direc = os.path.join(tb_logs_direc, str(args.robust_lambda))
         tb_exp_direc = os.path.join(tb_logs_direc, "{}").format(unique_token)
         logger.setup_tb(tb_exp_direc)
         args.model_path = tb_exp_direc

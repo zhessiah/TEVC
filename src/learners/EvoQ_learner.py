@@ -359,13 +359,24 @@ class EvoQLearner:
         with th.no_grad():
             normal_global_q = self.mixer(normal_chosen_q, batch["state"][:, :-1])  # (batch, seq_len-1, 1)
         
-        # === Step 2: 随机选择一个 Agent 进行故障注入 ===
+        # === Step 2: 使用攻击者选择的 Agent 进行故障注入 ===
         n_agents = self.args.n_agents
         batch_size = batch.batch_size
         seq_len = normal_chosen_q.shape[1]
         
-        # 对每个样本随机选择一个故障 Agent
-        faulty_agent_indices = th.randint(0, n_agents, (batch_size,), device=self.device)  # (batch,)
+        # 使用batch中记录的攻击者选择的受害者 (由Attacker网络选择)
+        # victim_id shape: (batch, seq_len, 1), 值为 [0, n_agents], n_agents表示"不攻击"
+        victim_ids = batch["victim_id"][:, :-1].squeeze(-1)  # (batch, seq_len-1)
+        
+        # 对每个样本,选择该样本中最常被攻击的Agent作为故障Agent
+        # 如果全是no-attack(n_agents),则随机选择
+        faulty_agent_indices = th.zeros(batch_size, dtype=th.long, device=self.device)
+        for b in range(batch_size):
+            victim_counts = th.bincount(victim_ids[b].long(), minlength=n_agents+1)[:n_agents]
+            if victim_counts.sum() > 0:  # 有实际攻击发生
+                faulty_agent_indices[b] = victim_counts.argmax()
+            else:  # 该样本中没有攻击,随机选择
+                faulty_agent_indices[b] = th.randint(0, n_agents, (1,), device=self.device)
         
         # === Step 3: 注入拜占庭故障 ===
         faulty_chosen_q = normal_chosen_q.clone()  # (batch, seq_len-1, n_agents)
@@ -538,12 +549,21 @@ class EvoQLearner:
         # 设置为 eval 模式
         pop_genome.eval()
         
-        # === Step 1: 创建故障场景（随机选择一个 Agent 故障）===
+        # === Step 1: 创建故障场景（使用攻击者选择的Agent）===
         n_agents = self.args.n_agents
         batch_size = batch.batch_size
         
-        # 对每个样本随机选择一个故障 Agent
-        faulty_agent_indices = th.randint(0, n_agents, (batch_size,), device=self.device)
+        # 使用batch中记录的攻击者选择的受害者 (由Attacker网络选择)
+        victim_ids = batch["victim_id"][:, :-1].squeeze(-1)  # (batch, seq_len-1)
+        
+        # 对每个样本,选择该样本中最常被攻击的Agent作为故障Agent
+        faulty_agent_indices = th.zeros(batch_size, dtype=th.long, device=self.device)
+        for b in range(batch_size):
+            victim_counts = th.bincount(victim_ids[b].long(), minlength=n_agents+1)[:n_agents]
+            if victim_counts.sum() > 0:  # 有实际攻击发生
+                faulty_agent_indices[b] = victim_counts.argmax()
+            else:  # 该样本中没有攻击,随机选择
+                faulty_agent_indices[b] = th.randint(0, n_agents, (1,), device=self.device)
         
         # 计算正常情况下的 Agent Q 值
         pop_genome.init_hidden(batch.batch_size)
