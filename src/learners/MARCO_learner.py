@@ -15,7 +15,7 @@ from utils.attack_util import logits_margin, attack, get_diff, noise_atk, get_ma
 from controllers import REGISTRY as mac_REGISTRY
 
 
-class EvoQLearner:
+class MARCOLearner:
     def __init__(self, genome, pop_genome, scheme, logger, args):
         self.args = args
         self.Genome = genome  # Single Genome (双MAC) for RL training

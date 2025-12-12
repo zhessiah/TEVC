@@ -1,4 +1,4 @@
-# --- EvoQ specific parameters ---
+# --- MARCO specific parameters ---
 
 # use epsilon greedy action selector
 action_selector: "epsilon_greedy"
@@ -22,7 +22,7 @@ mac: "attack_mac"
 agent: "n_rnn"
 agent_output_type: q
 
-learner: "EvoQ_learner"
+learner: "MARCO_learner"
 mixer: "qmix"
 mixing_embed_dim: 32
 hypernet_embed: 64
@@ -80,45 +80,45 @@ alpha_start: 0.3                        # Start point (P_start) for linear ramp
 alpha_end: 0.8                          # End point (P_end) for linear ramp
 td_init_steps: 50                       # Number of training steps to compute baseline TD_init
 
-# Lamarckian Co-evolution (SGD Injection into Evolution)
-use_lamarckian_sgd: True                # Enable Lamarckian SGD finetuning of elites
-num_finetune_elites: 3                  # Number of top elites to finetune with SGD
-lamarckian_sgd_steps: 1                 # Number of SGD steps per elite
-finetune_lr: 0.0001                     # Learning rate for Lamarckian finetuning (conservative)
-max_finetune_loss: 100.0                # Maximum loss threshold for finetuning (prevent divergence)
-finetune_grad_clip: 5.0                 # Gradient clipping for finetuning (prevent explosion)
+# Memetic Co-evolution (SGD Injection into Evolution)
+use_memetic_update: True                # Enable Memetic SGD update of elites
+num_memetic_elites: 3                   # Number of top elites to update with SGD
+memetic_update_steps: 1                 # Number of SGD steps per elite
+memetic_update_lr: 0.0001               # Learning rate for Memetic update (conservative)
+max_memetic_update_loss: 100.0          # Maximum loss threshold for update (prevent divergence)
+memetic_update_grad_clip: 5.0           # Gradient clipping for update (prevent explosion)
 
 # RL → Evolution Injection Strategy
 use_rl_injection: True                 # Enable legacy RL → Evo injection (replaced by new logic)
 
-# --- Attacker Lamarckian SGD (Co-evolution Enhancement) ---
-# Enable gradient-based fine-tuning for elite attackers to optimize quality objective
+# --- Attacker Memetic Update (Co-evolution Enhancement) ---
+# Enable gradient-based update for elite attackers to optimize quality objective
 # This creates an evolutionary arms race: defenders evolve robustness → attackers break defenses
-use_attacker_lamarckian_sgd: True       # Enable Lamarckian SGD fine-tuning for elite attackers
+use_attacker_memetic_update: True       # Enable Memetic SGD update for elite attackers
                                         # Optimizes quality (negative defender reward) objective
                                         
-num_finetune_attackers: 3               # Number of top elite attackers to fine-tune
+num_memetic_attackers: 3                # Number of top elite attackers to update
                                         # Recommended: 3-5, more increases computation cost
                                         # These are the best performers from Pareto front
                                         
-attacker_lamarckian_sgd_steps: 1        # Number of SGD optimization steps per attacker
+attacker_memetic_update_steps: 1        # Number of SGD optimization steps per attacker
                                         # 1-3 steps recommended to avoid overfitting
                                         # More steps = stronger adaptation but potential overfitting
                                         
-attacker_finetune_lr: 0.0001            # Learning rate for attacker fine-tuning
+attacker_memetic_update_lr: 0.0001      # Learning rate for attacker update
                                         # Default: attack_lr * 0.1 (conservative)
                                         # Increase if quality loss decreases slowly
                                         # Decrease if training becomes unstable
                                         
-attacker_finetune_reg: 0.01             # Sparsity regularization weight (KL divergence)
+attacker_memetic_update_reg: 0.01       # Sparsity regularization weight (KL divergence)
                                         # Controls victim selection diversity
                                         # Higher = more sparse/stealthy attacks
                                         # Lower = more aggressive attacks
                                         
-attacker_finetune_grad_clip: 5.0        # Gradient clipping threshold for stability
+attacker_memetic_update_grad_clip: 5.0  # Gradient clipping threshold for stability
                                         # Default: grad_norm_clip * 0.5 (more conservative)
                                         # Decrease if gradients explode (NaN/Inf)
-                                        # Prevents gradient explosion during fine-tuning
+                                        # Prevents gradient explosion during update
 
 
 # --- Attacker parameters ---
@@ -142,4 +142,4 @@ sparse_ref_delta: 0.05
 load_sparse_ref_delta: 0.05
 attacker_pop_size: 20
 
-name: "EvoQ_env=8_adam_td_lambda"
+name: "MARCO_env=8_adam_td_lambda"
