@@ -486,9 +486,9 @@ def run_sequential(args, logger):
                     env_precise_fitness = learner.calculate_TD_error(episode_batch, i)
                     fitness[i].append(-env_precise_fitness.cpu().numpy())
                     
-                    # 2. Value Confidence: 期望 Q 值 (衡量策略有多强)
-                    confidence_Q_fitness = learner.calculate_confidence_Q(episode_batch, i)
-                    fitness[i].append(confidence_Q_fitness.cpu().numpy())
+                    # 2. Value Confidence
+                    # confidence_Q_fitness = learner.calculate_confidence_Q(episode_batch, i)
+                    # fitness[i].append(confidence_Q_fitness.cpu().numpy())
                     
                     # === Robustness Metrics (右翼) ===
                     # 3. Attack Sensitivity: 负 Global Q Smoothness (衡量受影响多小)
@@ -496,25 +496,25 @@ def run_sequential(args, logger):
                     fitness[i].append(-robust_smooth_fitness.cpu().numpy())
                     
                     # 4. Robustness Confidence / Evolutionary Consensus: 鲁棒性确定性或进化共识
-                    if use_evolutionary_consensus:
-                        # TEVC特供版：进化共识得分 (Evolutionary Consensus Score)
-                        # 结合 Twin-Q 内部一致性 + 种群集成一致性
-                        # F4 = -(KL(π_Q1||π_Q2) + β·KL(π_me||π_ensemble))
-                        evolutionary_consensus = learner.calculate_evolutionary_consensus(
-                            episode_batch, i, elite_indices
-                        )
-                        fitness[i].append(evolutionary_consensus.cpu().numpy())
+                    # if use_evolutionary_consensus:
+                    #     # TEVC特供版：进化共识得分 (Evolutionary Consensus Score)
+                    #     # 结合 Twin-Q 内部一致性 + 种群集成一致性
+                    #     # F4 = -(KL(π_Q1||π_Q2) + β·KL(π_me||π_ensemble))
+                    #     evolutionary_consensus = learner.calculate_evolutionary_consensus(
+                    #         episode_batch, i, elite_indices
+                    #     )
+                    #     fitness[i].append(evolutionary_consensus.cpu().numpy())
                         
-                    elif use_twin_confidence:
-                        # 增强版：计算双重熵+分歧，取负得到"双重自信度"
-                        adversarial_entropy = learner.calculate_twin_adversarial_entropy(episode_batch, i)
-                        robustness_confidence = -adversarial_entropy  # 熵越低，自信度越高
-                        fitness[i].append(robustness_confidence.cpu().numpy())
-                    else:
-                        # 基础版：计算单一熵，取负得到"自信度"
-                        adversarial_entropy = learner.calculate_adversarial_entropy(episode_batch, i)
-                        robustness_confidence = -adversarial_entropy  # 熵越低,自信度越高
-                        fitness[i].append(robustness_confidence.cpu().numpy())
+                    # elif use_twin_confidence:
+                    #     # 增强版：计算双重熵+分歧，取负得到"双重自信度"
+                    #     adversarial_entropy = learner.calculate_twin_adversarial_entropy(episode_batch, i)
+                    #     robustness_confidence = -adversarial_entropy  # 熵越低，自信度越高
+                    #     fitness[i].append(robustness_confidence.cpu().numpy())
+                    # else:
+                    #     # 基础版：计算单一熵，取负得到"自信度"
+                    #     adversarial_entropy = learner.calculate_adversarial_entropy(episode_batch, i)
+                    #     robustness_confidence = -adversarial_entropy  # 熵越低,自信度越高
+                    #     fitness[i].append(robustness_confidence.cpu().numpy())
                     
                     # 5. Adversarial Behavioral Novelty (Quality-Diversity): 对抗性行为新颖度
                     if use_adversarial_novelty:
