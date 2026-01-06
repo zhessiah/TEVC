@@ -36,7 +36,8 @@ bash install_gfootball.sh
 
 ```shell
 # For SMAC
-python3 src/main.py --config=qmix --env-config=sc2 with env_args.map_name=5m_vs_6m
+conda activate ROMANCE
+CUDA_VISIBLE_DEVICES=1 python3 src/main.py --config=MARCO --env-config=sc2 with env_args.map_name=MMM
 ```
 
 ```shell
