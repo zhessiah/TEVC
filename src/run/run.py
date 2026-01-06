@@ -446,93 +446,26 @@ def run_sequential(args, logger):
             if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
                 # print('EA starts')
                 
-                # === Step 1: Lamarckian SGD Injection (拉马克微调阶段) ===
-                # 对精英个体进行 SGD 微调，使其快速适应当前环境
-                use_lamarckian_sgd = getattr(args, 'use_lamarckian_sgd', True)  # 默认开启
-                num_finetune_elites = getattr(args, 'num_finetune_elites', 3)  # 微调 Top-K 精英
-                num_sgd_steps = getattr(args, 'lamarckian_sgd_steps', 1)  # SGD 步数
-                
-                if use_lamarckian_sgd:
-                    # 获取当前精英索引
-                    elite_indices_prev = best_agents if hasattr(learner, 'best_agents') else list(range(min(num_finetune_elites, args.pop_size)))
-                    
-                    logger.console_logger.info(f"[Lamarckian SGD] Finetuning Top-{num_finetune_elites} elites with {num_sgd_steps} SGD steps...")
-                    
-                    for elite_idx in best_agents:
-                        # 对精英个体进行 SGD 微调（直接修改其权重）
-                        td_loss = learner.lamarckian_finetune(population[elite_idx], episode_batch, num_sgd_steps)
-                        
-                        if args.use_tensorboard and elite_idx == elite_indices_prev[0]:
-                            logger.log_stat("lamarckian_td_loss", td_loss, runner.t_env)
-                    
-                    logger.console_logger.info(f"[Lamarckian SGD] Completed. Elite {elite_indices_prev[0]} TD Loss: {td_loss:.6f}")
-                
-                # === Step 2: Fitness Evaluation ===
-                # Reset fitness to list of lists for append operations
+                # === Step 1: DEPRECATED - Lamarckian SGD Injection ===
+                # MACO_overview.md V6 refactoring: Explicit memetic learning is REMOVED
+                # Main agent learning IS the implicit memetic mechanism
+                # Only memetic injection (rl_to_evo_excluding_elites) is used
+                use_lamarckian_sgd = False  # Force disable (deprecated)
+                     
+                # === Step 2: Fitness Evaluation (Simplified to 2 Objectives) ===
+                # MACO V6: Defenders have only 2 objectives
+                # 1. Optimality: TD Error (environment fitting)
+                # 2. Robustness: Fault Isolation Ratio (Byzantine tolerance)
                 fitness = [[] for _ in range(args.pop_size)]
                 
-                # Determine which robustness confidence metric to use
-                use_evolutionary_consensus = getattr(args, 'use_evolutionary_consensus', False)
-                use_twin_confidence = getattr(args, 'use_twin_adversarial_confidence', False)
-                use_adversarial_novelty = getattr(args, 'use_adversarial_novelty', False)
-                
-                # Get current elite indices for population consensus calculation
-                # Use the best agents from previous epoch (if available)
-                elite_indices = best_agents if hasattr(learner, 'best_agents') else list(range(min(3, args.pop_size)))
-                
                 for i in range(args.pop_size):
-                    # === Optimality Metrics (左翼) ===
-                    # 1. Environment Fitness: 负 TD Error (衡量Q函数有多准)
+                    # Objective 1: Optimality (TD Error)
                     env_precise_fitness = learner.calculate_TD_error(episode_batch, i)
                     fitness[i].append(-env_precise_fitness.cpu().numpy())
                     
-                    # 2. Value Confidence
-                    # confidence_Q_fitness = learner.calculate_confidence_Q(episode_batch, i)
-                    # fitness[i].append(confidence_Q_fitness.cpu().numpy())
-                    
-                    # === Robustness Metrics (右翼) ===
-                    # 3. Attack Sensitivity: 负 Global Q Smoothness (衡量受影响多小)
+                    # Objective 2: Robustness (Fault Isolation Ratio)
                     robust_smooth_fitness = learner.calculate_adversarial_loss(episode_batch, i)
                     fitness[i].append(-robust_smooth_fitness.cpu().numpy())
-                    
-                    # 4. Robustness Confidence / Evolutionary Consensus: 鲁棒性确定性或进化共识
-                    # if use_evolutionary_consensus:
-                    #     # TEVC特供版：进化共识得分 (Evolutionary Consensus Score)
-                    #     # 结合 Twin-Q 内部一致性 + 种群集成一致性
-                    #     # F4 = -(KL(π_Q1||π_Q2) + β·KL(π_me||π_ensemble))
-                    #     evolutionary_consensus = learner.calculate_evolutionary_consensus(
-                    #         episode_batch, i, elite_indices
-                    #     )
-                    #     fitness[i].append(evolutionary_consensus.cpu().numpy())
-                        
-                    # elif use_twin_confidence:
-                    #     # 增强版：计算双重熵+分歧，取负得到"双重自信度"
-                    #     adversarial_entropy = learner.calculate_twin_adversarial_entropy(episode_batch, i)
-                    #     robustness_confidence = -adversarial_entropy  # 熵越低，自信度越高
-                    #     fitness[i].append(robustness_confidence.cpu().numpy())
-                    # else:
-                    #     # 基础版：计算单一熵，取负得到"自信度"
-                    #     adversarial_entropy = learner.calculate_adversarial_entropy(episode_batch, i)
-                    #     robustness_confidence = -adversarial_entropy  # 熵越低,自信度越高
-                    #     fitness[i].append(robustness_confidence.cpu().numpy())
-                    
-                    # 5. Adversarial Behavioral Novelty (Quality-Diversity): 对抗性行为新颖度
-                    if use_adversarial_novelty:
-                        # TEVC特供版：基于存档的新颖度搜索 (Archive-Based Novelty Search)
-                        # 衡量当前个体在对抗样本下的行为与历史精英的差异性
-                        # F5 = avg_distance(π_me(·|o_adv), π_archive(·|o_adv))
-                        adversarial_novelty = learner.calculate_adversarial_novelty(episode_batch, i)
-                        fitness[i].append(adversarial_novelty.cpu().numpy())
-                
-                # Log EA execution with current alpha_t
-                num_objectives = len(fitness[0])
-                consensus_mode = "Evolutionary Consensus" if use_evolutionary_consensus else ("Twin-Q" if use_twin_confidence else "Basic")
-                novelty_mode = " + Novelty" if use_adversarial_novelty else ""
-                logger.console_logger.info(
-                    f"[EA Epoch] Episode {episode}, Mode: {consensus_mode}{novelty_mode}, "
-                    f"Objectives: {num_objectives}, Alpha_t: {alpha_t:.3f} "
-                    f"(Optimality weight: {1-alpha_t:.3f}, Robustness weight: {alpha_t:.3f})"
-                )
                 
                 # === Step 3: Evolutionary Selection (进化选择阶段) ===
                 # Pass alpha_t to evolver for learning-assisted dynamic weighting
@@ -540,8 +473,8 @@ def run_sequential(args, logger):
                 best_agents = elite_index
                 
                 # Update elite archive with current elites
-                if use_adversarial_novelty and len(elite_index) > 0:
-                    learner.update_elite_archive(elite_index, episode_batch)
+                # if use_adversarial_novelty and len(elite_index) > 0:
+                #     learner.update_elite_archive(elite_index, episode_batch)
                 
                 logger.console_logger.info(
                     f"[EA Selection] New generation created. "
@@ -564,19 +497,20 @@ def run_sequential(args, logger):
                 if args.adversarial_training:
                     logger.console_logger.info("[Attacker Evolution] Starting attacker population evolution...")
                     
-                    # === Step 1: Lamarckian SGD for Elite Attackers ===
-                    use_attacker_lamarckian = getattr(args, 'use_attacker_lamarckian_sgd', True)
+                    # === Step 1: Memetic SGD for Elite Attackers (NEW: Budget-Modulated Advantage) ===
+                    # Uses new attack advantage function from MACO V6
+                    use_attacker_lamarckian = getattr(args, 'use_attacker_memetic_sgd', True)
                     num_finetune_attackers = getattr(args, 'num_finetune_attackers', 3)
-                    attacker_sgd_steps = getattr(args, 'attacker_lamarckian_sgd_steps', 1)
+                    attacker_sgd_steps = getattr(args, 'attacker_memetic_sgd_steps', 1)
                     
                     if use_attacker_lamarckian:
                         logger.console_logger.info(
-                            f"[Attacker Lamarckian SGD] Finetuning Top-{num_finetune_attackers} "
-                            f"elite attackers with {attacker_sgd_steps} SGD steps..."
+                            f"[Attacker Memetic SGD] Finetuning Top-{num_finetune_attackers} "
+                            f"elite attackers with {attacker_sgd_steps} SGD steps (Attack Advantage)..."
                         )
                         
                         for attacker_idx in best_attackers[:num_finetune_attackers]:
-                            # 微调该attacker以最大化negative defender reward
+                            # 微调该attacker使用Attack Advantage (budget-modulated)
                             quality_loss = learner.lamarckian_finetune_attacker(
                                 population_attackers[attacker_idx], 
                                 episode_batch, 
@@ -584,50 +518,77 @@ def run_sequential(args, logger):
                             )
                             
                             if args.use_tensorboard and attacker_idx == best_attackers[0]:
-                                logger.log_stat("attacker_lamarckian_quality_loss", quality_loss, runner.t_env)
+                                logger.log_stat("attacker_memetic_advantage_loss", quality_loss, runner.t_env)
                         
                         logger.console_logger.info(
-                            f"[Attacker Lamarckian SGD] Completed. "
-                            f"Elite {best_attackers[0]} Quality Loss: {quality_loss:.6f}"
+                            f"[Attacker Memetic SGD] Completed. "
+                            f"Elite {best_attackers[0]} Advantage Loss: {quality_loss:.6f}"
                         )
                     
-                    # === Step 2: Calculate attacker fitness (Simple pattern like Genome fitness) ===
+                    # === Step 2: Calculate attacker fitness (Simplified to 2 Objectives) ===
+                    # CORRECTED V6: TD Error Maximization with Counterfactual Actions
+                    # 
+                    # Mathematical Foundation:
+                    # F_att,1(φ) = E_τ [(y - Q_tot(s, a_φ))²]
+                    # 
+                    # Where a_φ = counterfactual actions under attacker φ's Byzantine interference
+                    # 
+                    # Byzantine Attack Model:
+                    # - Attacker φ selects victims via φ.batch_forward(batch, t)
+                    # - Victim's actions are replaced with Byzantine (worst) actions
+                    # - Different attackers → different victim selections → different actions → different TD errors
+                    # 
+                    # Key Efficiency:
+                    # 1. NO environment rollout needed (offline batch computation)
+                    # 2. Reuses batch's pre-computed byzantine_actions
+                    # 3. Only recomputes victim selection (cheap forward pass)
+                    # 4. Dense signal: per-timestep TD error (vs per-episode reward)
+                    #
+                    # Why this works:
+                    # - calculate_attacker_TD_error() constructs counterfactual actions
+                    # - Uses attacker i to select victims for each timestep
+                    # - Replaces victim actions with byzantine_actions from batch
+                    # - Computes Q(s, a_counterfactual) and TD error
+                    # - Different attackers produce different counterfactual actions → different TD errors
                     attacker_fitness = [[] for _ in range(args.attacker_pop_size)]
                     
                     for i in range(args.attacker_pop_size):
-                        # Fitness 1: Quality - negative mean return (lower defender reward = better attacker)
-                        quality = learner.calculate_attacker_quality(episode_batch, i, population_attackers)
-                        attacker_fitness[i].append(-quality.cpu().numpy())
+                        # Objective 1: TD Error Maximization (CORRECTED V6)
+                        # Uses counterfactual action construction (no env rollout!)
+                        with th.no_grad():
+                            td_error = learner.calculate_attacker_TD_error(
+                                episode_batch, i, population_attackers
+                            )
                         
-                        # Fitness 2: Efficiency - negative attack frequency
-                        efficiency = learner.calculate_attacker_efficiency(episode_batch, i, population_attackers)
-                        attacker_fitness[i].append(-efficiency.cpu().numpy())
+                        # Higher TD error = better attacker (more cognitive disruption)
+                        attacker_fitness[i].append(td_error.item())
                         
-                        # Fitness 3: Diversity - behavioral novelty
+                        # Objective 2: Behavioral Novelty (unchanged from V6)
+                        # Diversity to avoid local optima
                         novelty = learner.calculate_attacker_behavioral_novelty(
                             episode_batch, i, best_attackers, population_attackers
                         )
-                        attacker_fitness[i].append(novelty.cpu().numpy())
+                        attacker_fitness[i].append(novelty.item() if th.is_tensor(novelty) else novelty)
                     
                     # === Step 3: Evolutionary selection for attackers ===
-                    # Use same alpha_t as defenders for consistency (optional: could use different schedule)
                     attacker_elite_index, attacker_replace_index = attacker_evolver.epoch(
                         population_attackers, attacker_fitness, agent_level=True, alpha_t=alpha_t
                     )
                     best_attackers = attacker_elite_index
                     
                     logger.console_logger.info(
-                        f"[Attacker Evolution] New attacker generation created. "
-                        f"Elites: {attacker_elite_index[:5]}, Replace: {attacker_replace_index[:5] if len(attacker_replace_index) > 0 else []}"
+                        f"[Attacker Evolution] New attacker generation. "
+                        f"Elites: {attacker_elite_index[:5]}"
                     )
                     
                     # Log attacker fitness statistics
                     if args.use_tensorboard:
-                        for i in range(min(3, args.attacker_pop_size)):  # Log top 3 attackers
+                        for i in range(min(3, args.attacker_pop_size)):
                             if i < len(attacker_fitness):
-                                logger.log_stat(f"attacker_{i}_quality", attacker_fitness[i][0], runner.t_env)
-                                logger.log_stat(f"attacker_{i}_efficiency", attacker_fitness[i][1], runner.t_env)
-                                logger.log_stat(f"attacker_{i}_novelty", attacker_fitness[i][2], runner.t_env) 
+                                # Objective 1: TD Error (cognitive disruption metric)
+                                logger.log_stat(f"attacker_{i}_td_error", attacker_fitness[i][0], runner.t_env)
+                                # Objective 2: Behavioral Novelty (diversity metric)
+                                logger.log_stat(f"attacker_{i}_novelty", attacker_fitness[i][1], runner.t_env) 
         
         
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
@@ -640,16 +601,35 @@ def run_sequential(args, logger):
 
             last_test_T = runner.t_env
             
-            # if (args.test_attack and runner.t_env >= args.t_max // 3 and runner.t_env <= args.t_max // 3 * 2): # attack during the second third of the training
-            # if (args.all_test_attack):
-            #     runner.set_perturb(True) 
-            # elif (args.test_attack and runner.t_env >= args.t_max // 3 and runner.t_env <= args.t_max // 3 * 2): # attack during the second third of the training
-            #     runner.set_perturb(True)
-            for _ in range(n_test_runs):
-                if args.EA:
-                    runner.run(genome, test_mode=True)
-                else:
-                    runner.run(mac, test_mode=True)
+            # === 双测试: 对抗训练模式 ===
+            if args.EA and args.adversarial_training:
+                # 测试 1: 干净性能 (无攻击) - 使用 run()
+                logger.console_logger.info("[测试1/2] 评估干净性能 (无攻击)...")
+                original_num_attack_test = args.num_attack_test
+                args.num_attack_test = 0
+                
+                for _ in range(n_test_runs):
+                    runner.run(genome, test_mode=True)  
+                
+                args.num_attack_test = original_num_attack_test
+                
+                # 测试 2: 精英攻击者下的鲁棒性 - 使用 run_under_attack()
+                if len(best_attackers) > 0:
+                    logger.console_logger.info("[测试2/2] 评估对抗鲁棒性 (精英攻击者)...")
+                    elite_attacker_id = best_attackers[0]
+                    genome.mac1.set_attacker(population_attackers[elite_attacker_id])
+                    
+                    for _ in range(n_test_runs):
+                        runner.run_under_attack(genome, test_mode=True)  # 使用 run_under_attack() -> test_under_attack_*
+                    
+                    logger.console_logger.info(f"[双测试完成] 精英攻击者 {elite_attacker_id}")
+            else:
+                # 标准测试 (单一测试)
+                for _ in range(n_test_runs):
+                    if args.EA:
+                        runner.run(genome, test_mode=True)
+                    else:
+                        runner.run(mac, test_mode=True)
 
         
 

@@ -180,135 +180,139 @@ class MLPAttacker(nn.Module):
     #     return True
 
 
-class Population:
-    """
-    Deprecated: This class is kept for backward compatibility only.
-    Use MLPAttacker directly instead.
+# class Population:
+#     """
+#     Deprecated: This class is kept for backward compatibility only.
+#     Use MLPAttacker directly instead.
     
-    Population manages multiple MLPAttacker instances for backward compatibility.
-    For new code, create MLPAttacker instances directly and call their train() method.
-    """
-    def __init__(self, args):
-        self.args = args
-        self.size = args.pop_size
-        self.attack_num = args.attack_num
-        self.episode_limit = self.args.individual_sample_episode
-        self.attack_agent_selector = action_REGISTRY[args.attack_agent_selector](args)
-        self.attackers = []
-        self.logger = None  # Will be set externally if needed
+#     Population manages multiple MLPAttacker instances for backward compatibility.
+#     For new code, create MLPAttacker instances directly and call their train() method.
+#     """
+#     def __init__(self, args):
+#         self.args = args
+#         self.size = args.pop_size
+#         self.attack_num = args.attack_num
+#         self.episode_limit = self.args.individual_sample_episode
+#         self.attack_agent_selector = action_REGISTRY[args.attack_agent_selector](args)
+#         self.attackers = []
+#         self.logger = None  # Will be set externally if needed
 
-    def generate_attackers(self):
-        """Generate a population of attackers."""
-        candidates = []
-        for _ in range(self.size):
-            candidates.append(MLPAttacker(self.args))
-        return candidates
+#     def generate_attackers(self):
+#         """Generate a population of attackers."""
+#         candidates = []
+#         for _ in range(self.size):
+#             candidates.append(MLPAttacker(self.args))
+#         return candidates
 
-    def reset(self, attackers):
-        """Reset population with given attackers."""
-        self.attackers = attackers
-        assert len(self.attackers) == self.size, print(len(self.attackers), self.size)
+#     def reset(self, attackers):
+#         """Reset population with given attackers."""
+#         self.attackers = attackers
+#         assert len(self.attackers) == self.size, print(len(self.attackers), self.size)
 
-    def setup_buffer(self, scheme, groups, preprocess):
-        """Setup buffer for each attacker in the population."""
-        if self.args.one_buffer:
-            # Create one shared buffer
-            self.buffer = ReplayBuffer(scheme, groups, self.args.attacker_buffer_size,
-                                      self.args.episode_limit+1, preprocess=preprocess,
-                                      device="cpu" if self.args.buffer_cpu_only else self.args.device)
-            # Share the buffer with all attackers
-            for attacker in self.attackers:
-                attacker.buffer = self.buffer
-        else:
-            # Each attacker gets its own buffer
-            for attacker in self.attackers:
-                attacker.setup_buffer(scheme, groups, preprocess)
+#     def setup_buffer(self, scheme, groups, preprocess):
+#         """Setup buffer for each attacker in the population."""
+#         if self.args.one_buffer:
+#             # Create one shared buffer
+#             self.buffer = ReplayBuffer(scheme, groups, self.args.attacker_buffer_size,
+#                                       self.args.episode_limit+1, preprocess=preprocess,
+#                                       device="cpu" if self.args.buffer_cpu_only else self.args.device)
+#             # Share the buffer with all attackers
+#             for attacker in self.attackers:
+#                 attacker.buffer = self.buffer
+#         else:
+#             # Each attacker gets its own buffer
+#             for attacker in self.attackers:
+#                 attacker.setup_buffer(scheme, groups, preprocess)
 
-    def get_behavior_info(self, mac, runner):
-        """Evaluate behavior of all attackers in the population."""
-        last_attack_points = [[] for _ in range(self.size)]
-        last_returns = [[] for _ in range(self.size)]
-        last_won = [[] for _ in range(self.size)]
-        for i, attacker in enumerate(self.attackers):
-            mac.set_attacker(attacker)
-            runner.setup_mac(mac)
-            for k in range(self.args.attacker_eval_num):
-                _, episode_batch, mixed_points, attack_cnt, epi_return, won = runner.run(test_mode=True)
-                if k < 6:
-                    last_attack_points[i] += mixed_points[:max(1, attack_cnt)]
-                # need to be -return!!!
-                last_returns[i].append(-epi_return)
-                last_won[i].append(won)
-        last_mean_return = [np.mean(x) for x in last_returns]
-        last_won = [np.mean(x) for x in last_won]
-        return last_attack_points, last_mean_return, last_won
+#     def get_behavior_info(self, mac, runner):
+#         """Evaluate behavior of all attackers in the population."""
+#         last_attack_points = [[] for _ in range(self.size)]
+#         last_returns = [[] for _ in range(self.size)]
+#         last_won = [[] for _ in range(self.size)]
+#         for i, attacker in enumerate(self.attackers):
+#             mac.set_attacker(attacker)
+#             runner.setup_mac(mac)
+#             for k in range(self.args.attacker_eval_num):
+#                 _, episode_batch, mixed_points, attack_cnt, epi_return, won = runner.run(test_mode=True)
+#                 if k < 6:
+#                     last_attack_points[i] += mixed_points[:max(1, attack_cnt)]
+#                 # need to be -return!!!
+#                 last_returns[i].append(-epi_return)
+#                 last_won[i].append(won)
+#             # Clean up: remove attacker after evaluation
+#             mac.set_attacker(None)
+#         last_mean_return = [np.mean(x) for x in last_returns]
+#         last_won = [np.mean(x) for x in last_won]
+#         return last_attack_points, last_mean_return, last_won
 
-    def store(self, episode_batch, mixed_points, attack_cnt, attacker_id):
-        """Store episode data for a specific attacker."""
-        # Store in the attacker's buffer
-        self.attackers[attacker_id].store(episode_batch)
+#     def store(self, episode_batch, mixed_points, attack_cnt, attacker_id):
+#         """Store episode data for a specific attacker."""
+#         # Store in the attacker's buffer
+#         self.attackers[attacker_id].store(episode_batch)
 
-    def train(self, gen, train_step):
-        """
-        Train all attackers in the population.
+#     def train(self, gen, train_step):
+#         """
+#         Train all attackers in the population.
         
-        Note: This simplified version trains each attacker independently.
-        Diversity loss has been removed. For diversity-aware training,
-        implement it externally using the individual attackers.
-        """
-        success = True
-        for i, attacker in enumerate(self.attackers):
-            # Train this attacker
-            log_this_step = (train_step == self.args.population_train_steps)
-            train_success = attacker.train(
-                logger=self.logger if log_this_step else None,
-                log_step=gen if log_this_step else None
-            )
-            if not train_success:
-                success = False
+#         Note: This simplified version trains each attacker independently.
+#         Diversity loss has been removed. For diversity-aware training,
+#         implement it externally using the individual attackers.
+#         """
+#         success = True
+#         for i, attacker in enumerate(self.attackers):
+#             # Train this attacker
+#             log_this_step = (train_step == self.args.population_train_steps)
+#             train_success = attacker.train(
+#                 logger=self.logger if log_this_step else None,
+#                 log_step=gen if log_this_step else None
+#             )
+#             if not train_success:
+#                 success = False
         
-        return success
+#         return success
 
-    def cuda(self):
-        """Move all attackers to CUDA."""
-        for attacker in self.attackers:
-            attacker.cuda()
-            if hasattr(attacker, 'target_net'):
-                attacker.target_net.cuda()
+#     def cuda(self):
+#         """Move all attackers to CUDA."""
+#         for attacker in self.attackers:
+#             attacker.cuda()
+#             if hasattr(attacker, 'target_net'):
+#                 attacker.target_net.cuda()
 
-    def save_models(self, path):
-        """Save all attacker models."""
-        for i in range(len(self.attackers)):
-            th.save(self.attackers[i].state_dict(), "{0}/attacker_{1}.th".format(path, i))
+#     def save_models(self, path):
+#         """Save all attacker models."""
+#         for i in range(len(self.attackers)):
+#             th.save(self.attackers[i].state_dict(), "{0}/attacker_{1}.th".format(path, i))
 
-    def load_models(self, load_path):
-        """Load attacker models from disk."""
-        attackers = []
-        for i in range(len(os.listdir(load_path))):
-            full_name = os.path.join(load_path, f"attacker_{i}.th")
-            attacker = MLPAttacker(self.args, load=True).to(self.args.device)
-            attacker.load_state_dict(th.load(full_name, map_location=lambda storage, loc: storage))
-            attackers.append(attacker)
-        self.reset(attackers)
+#     def load_models(self, load_path):
+#         """Load attacker models from disk."""
+#         attackers = []
+#         for i in range(len(os.listdir(load_path))):
+#             full_name = os.path.join(load_path, f"attacker_{i}.th")
+#             attacker = MLPAttacker(self.args, load=True).to(self.args.device)
+#             attacker.load_state_dict(th.load(full_name, map_location=lambda storage, loc: storage))
+#             attackers.append(attacker)
+#         self.reset(attackers)
     
-    def long_eval(self, mac, runner, logger, threshold=0.8, num_eval=100, save_path=None):
-        """Perform long evaluation of all attackers."""
-        logger.console_logger.info(f"Start long eval, with {len(self.attackers)} attacker(s)")
-        all_returns = []
-        all_wons = []
-        for attacker_id, attacker in enumerate(self.attackers):
-            mac.set_attacker(attacker)
-            runner.setup_mac(mac)
-            returns = []
-            wons = []
-            for _ in tqdm(range(num_eval)):
-                _, episode_batch, mixed_points, attack_cnt, epi_return, won = runner.run(test_mode=True)
-                returns.append(-epi_return)
-                wons.append(won)
-            all_returns.append(np.mean(returns))
-            all_wons.append(np.mean(wons))
-            print("this attacker", attacker_id, " long eval returns: ", all_returns[-1])
-            print("this attacker", attacker_id, " long eval won rate: ", all_wons[-1])
-        print(
-            f"mean of test {len(all_returns)} attackers: return: {np.mean(all_returns)}, win_rate: {np.mean(all_wons)}")
+#     def long_eval(self, mac, runner, logger, threshold=0.8, num_eval=100, save_path=None):
+#         """Perform long evaluation of all attackers."""
+#         logger.console_logger.info(f"Start long eval, with {len(self.attackers)} attacker(s)")
+#         all_returns = []
+#         all_wons = []
+#         for attacker_id, attacker in enumerate(self.attackers):
+#             mac.set_attacker(attacker)
+#             runner.setup_mac(mac)
+#             returns = []
+#             wons = []
+#             for _ in tqdm(range(num_eval)):
+#                 _, episode_batch, mixed_points, attack_cnt, epi_return, won = runner.run(test_mode=True)
+#                 returns.append(-epi_return)
+#                 wons.append(won)
+#             all_returns.append(np.mean(returns))
+#             all_wons.append(np.mean(wons))
+#             print("this attacker", attacker_id, " long eval returns: ", all_returns[-1])
+#             print("this attacker", attacker_id, " long eval won rate: ", all_wons[-1])
+#             # Clean up: remove attacker after evaluation
+#             mac.set_attacker(None)
+#         print(
+#             f"mean of test {len(all_returns)} attackers: return: {np.mean(all_returns)}, win_rate: {np.mean(all_wons)}")
 

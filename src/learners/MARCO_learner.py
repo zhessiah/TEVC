@@ -204,110 +204,19 @@ class MARCOLearner:
         return mean_td_error
 
 
-    def calculate_confidence_Q(self, batch: EpisodeBatch, genome_index: int):
-        """
-        Calculate confidence Q metric for a specific Genome in the population.
-        Uses pop_genome[genome_index] for OPTIMALITY evaluation.
-        
-        Args:
-            batch: EpisodeBatch containing experience data
-            genome_index: Index of the Genome in self.pop_genome to evaluate
-            
-        Returns:
-            mean_confidence_Q: Mean confidence Q for the specified Genome (scalar tensor)
-        """
-        # Get the Genome from population
-        pop_genome = self.pop_genome[genome_index]
-        
-        # Get the relevant quantities (same as in train())
-        rewards = batch["reward"][:, :-1]
-        actions = batch["actions"][:, :-1]
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["filled"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        avail_actions = batch["avail_actions"]
-        
-        # Calculate estimated Q-Values using the population Genome
-        pop_genome.eval()  # Set to eval mode for evaluation
-        pop_genome.init_hidden(batch.batch_size)
-        mac_out = []
-        
-        with th.no_grad():  # No gradients needed for evaluation
-            for t in range(batch.max_seq_length):
-                agent_outs = pop_genome.forward(batch, t=t)  # min(q1, q2)
-                mac_out.append(agent_outs)
-        
-        mac_out = th.stack(mac_out, dim=1)  # (batch, seq_len, n_agents, n_actions)
-        
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
-        # Calculate mean confidence Q using the mixer from the population genome
-        with th.no_grad():
-            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
-        mean_confidence_Q = (chosen_action_qvals * mask).sum() / mask.sum()
-
-        return mean_confidence_Q
-
-
-    def calculate_adversarial_entropy(self, batch, genome_index):
-        """
-        Calculate adversarial entropy for robustness evaluation.
-        Uses pop_genome[genome_index] for ROBUSTNESS evaluation.
-        
-        Args:
-            batch: EpisodeBatch containing experience data
-            genome_index: Index of the Genome in self.pop_genome to evaluate
-            
-        Returns:
-            mean_entropy: Entropy (higher = more uncertain/less confident)
-        """
-        # Get the Genome from population
-        pop_genome = self.pop_genome[genome_index]
-        eval_mixer = self.mixer
-        
-        # Get mask for valid timesteps
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["filled"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        
-        # Set to eval mode
-        pop_genome.eval()
-        
-        # Create adversarial observations
-        adv_batch = noise_atk(batch, self.args)
-        
-        # Compute adversarial Global Q-values for all actions
-        pop_genome.init_hidden(batch.batch_size)
-        adv_global_q_list = []
-        
-        with th.no_grad():
-            for t in range(batch.max_seq_length):
-                # Get Q-values for all actions from pop_genome (min of mac1 and mac2)
-                agent_out = pop_genome.forward(adv_batch, t=t)  # (batch, n_agents, n_actions)
-                adv_global_q_list.append(agent_out)
-        
-        # Stack: (batch, seq_len, n_agents, n_actions)
-        adv_agent_q = th.stack(adv_global_q_list, dim=1)
-        
-        # Apply EVOLVED mixer to get Global Q for all actions
-        with th.no_grad():
-            adv_global_q = eval_mixer(adv_agent_q, adv_batch["state"])[:, :-1]  # (batch, seq_len-1, n_actions)
-        
-        # Compute Boltzmann distribution (softmax with temperature)
-        tau = getattr(self.args, 'adversarial_tau', 1.0)  # Temperature parameter
-        
-        # Compute probabilities: π(a|o_adv) = softmax(Q_tot(o_adv, a) / τ)
-        log_probs = th.nn.functional.log_softmax(adv_global_q / tau, dim=-1)  # (batch, seq_len-1, n_actions)
-        probs = th.exp(log_probs)  # (batch, seq_len-1, n_actions)
-        
-        # Compute entropy: H(π) = -Σ π(a) log π(a)
-        entropy = -(probs * log_probs).sum(dim=-1)  # (batch, seq_len-1)
-        
-        # Apply mask and compute mean
-        masked_entropy = entropy * mask.unsqueeze(-1)
-        mean_entropy = masked_entropy.sum() / mask.sum()
-        
-        # Return entropy directly (caller will negate it for "confidence" interpretation)
-        return mean_entropy
+    # ========== SIMPLIFIED DEFENDER FITNESS FUNCTIONS (2 objectives only) ==========
+    # Following MACO_overview.md V6 refactoring:
+    # Defender Fitness (2 objectives):
+    # 1. Optimality: TD Error (calculate_TD_error) - environment fitting accuracy
+    # 2. Robustness: Fault Isolation Ratio (calculate_adversarial_loss) - Byzantine fault tolerance
+    #
+    # REMOVED deprecated functions (moved to implicit mechanisms):
+    # - calculate_confidence_Q: Redundant with TD error
+    # - calculate_adversarial_entropy: Complexity reduction  
+    # - calculate_influence_constraint: Complexity reduction
+    # - calculate_evolutionary_consensus: Implicit via Pareto front
+    # - calculate_adversarial_novelty: Diversity via exploration
+    # =================================================================================
     
     def calculate_adversarial_loss(self, batch, genome_index):
         """
@@ -427,410 +336,19 @@ class MARCOLearner:
         # 返回负值（比率越小，fitness 越高）
         return -mean_isolation_ratio
     
-    def calculate_influence_constraint(self, batch, genome_index):
-        """
-        Fitness 4: 权力制衡约束 (Influence Constraint)
-        
-        计算 Mixer 权重分配的去中心化程度，防止"独裁结构"。
-        场景: 不看具体故障，只看权重分配结构
-        
-        数学定义: 负的最大单体影响力
-        首先计算每个 Agent 的影响力: I_k(s) = |Q_tot(Q_k+δ) - Q_tot(Q_k)|
-        F4 = -E[max_k I_k(s) + λ·Var(I)]
-        
-        物理含义:
-        - max_k I_k: 最大单体影响力（防止某个 Agent 权重过大）
-        - Var(I): 影响力方差（鼓励均衡分配）
-        - 迫使 Mixer 进化出去中心化、冗余的权重分配机制
-        
-        Args:
-            batch: EpisodeBatch containing experience data
-            genome_index: Index of the Genome in self.pop_genome to evaluate
-            
-        Returns:
-            constraint_score: 负的影响力约束值（越大越好）
-        """
-        # Get the Genome from population
-        pop_genome = self.pop_genome[genome_index]
-        
-        # Get mask for valid timesteps
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["filled"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        actions = batch["actions"][:, :-1]
-        
-        # Set to eval mode
-        pop_genome.eval()
-        
-        # === Step 1: 计算基准 Q 值 ===
-        pop_genome.init_hidden(batch.batch_size)
-        agent_q_list = []
-        
-        with th.no_grad():
-            for t in range(batch.max_seq_length):
-                agent_out = pop_genome.forward(batch, t=t)  # min(q1, q2)
-                agent_q_list.append(agent_out)
-        
-        agent_q = th.stack(agent_q_list, dim=1)  # (batch, seq_len, n_agents, n_actions)
-        chosen_q = th.gather(agent_q[:, :-1], dim=3, index=actions).squeeze(3)  # (batch, seq_len-1, n_agents)
-        
-        # 基准 Global Q
-        with th.no_grad():
-            baseline_global_q = self.mixer(chosen_q, batch["state"][:, :-1])  # (batch, seq_len-1, 1)
-        
-        # === Step 2: 计算每个 Agent 的影响力 ===
-        n_agents = self.args.n_agents
-        delta = getattr(self.args, 'influence_delta', 0.1)  # 扰动幅度
-        
-        influences = []  # List of (batch, seq_len-1) tensors
-        
-        for k in range(n_agents):
-            # 对 Agent k 的 Q 值添加扰动
-            perturbed_q = chosen_q.clone()  # (batch, seq_len-1, n_agents)
-            perturbed_q[:, :, k] = perturbed_q[:, :, k] + delta
-            
-            # 计算扰动后的 Global Q
-            with th.no_grad():
-                perturbed_global_q = self.mixer(perturbed_q, batch["state"][:, :-1])  # (batch, seq_len-1, 1)
-            
-            # 影响力 = |Q_tot(Q_k+δ) - Q_tot(Q_k)|
-            influence_k = th.abs(perturbed_global_q - baseline_global_q).squeeze(-1)  # (batch, seq_len-1)
-            influences.append(influence_k)
-        
-        # Stack: (n_agents, batch, seq_len-1)
-        influences_tensor = th.stack(influences, dim=0)
-        
-        # === Step 3: 计算最大影响力和方差 ===
-        # 最大单体影响力
-        max_influence, _ = influences_tensor.max(dim=0)  # (batch, seq_len-1)
-        
-        # 影响力方差（跨 agents）
-        influence_var = influences_tensor.var(dim=0)  # (batch, seq_len-1)
-        
-        # === Step 4: 计算约束值 ===
-        lambda_var = getattr(self.args, 'influence_lambda', 0.5)  # 方差权重
-        
-        constraint_per_timestep = max_influence + lambda_var * influence_var  # (batch, seq_len-1)
-        
-        # 应用 mask 并计算平均
-        masked_constraint = constraint_per_timestep * mask
-        mean_constraint = masked_constraint.sum() / (mask.sum() + 1e-8)
-        
-        # 返回负值（约束值越小，fitness 越高）
-        return -mean_constraint
+    # ========== REMOVED DEPRECATED FITNESS FUNCTIONS ==========
+    # Following MACO_overview.md V6 refactoring - complexity reduction
+    # Removed functions:
+    # - calculate_influence_constraint (权力制衡约束)
+    # - calculate_evolutionary_consensus (种群共识校准)  
+    # - calculate_adversarial_novelty (新颖性搜索)
+    # - _js_divergence (helper function)
+    # - update_elite_archive (helper function)
+    #
+    # Rationale: Simplified to 2-objective optimization for faster convergence
+    # Diversity is maintained through exploration (epsilon-greedy)
+    # ===========================================================
     
-    def calculate_evolutionary_consensus(self, batch, genome_index, elite_indices):
-        """
-        机制一：基于种群共识的鲁棒性校准 (Population-Consensus Calibration)
-        
-        **痛点**: 单个 genome 在面对故障时可能会产生"幻觉"（过度悲观或乐观）
-        **解决方案**: 利用群体智慧 (Swarm Intelligence) 校准个体的鲁棒性判断
-        
-        在故障场景下，要求当前 Genome 的 Q_tot 判断与种群 Top-K 精英的平均判断保持一致：
-        Penalty_consensus = ||Q_tot^me(faulty) - Mean(Q_tot^elites(faulty))||
-        
-        Args:
-            batch: EpisodeBatch containing experience data
-            genome_index: 当前评估的 Genome 索引
-            elite_indices: 精英 Genome 索引列表（按 fitness 排序）
-            
-        Returns:
-            consensus_penalty: 负的偏离度（越高=越一致，fitness 越好）
-        """
-        # 获取当前评估的 Genome
-        pop_genome = self.pop_genome[genome_index]
-        
-        # 获取 mask
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["filled"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        actions = batch["actions"][:, :-1]
-        
-        # 设置为 eval 模式
-        pop_genome.eval()
-        
-        # === Step 1: 创建故障场景（使用攻击者选择的Agent）===
-        n_agents = self.args.n_agents
-        batch_size = batch.batch_size
-        
-        # 使用batch中记录的攻击者选择的受害者 (由Attacker网络选择)
-        victim_ids = batch["victim_id"][:, :-1].squeeze(-1)  # (batch, seq_len-1)
-        
-        # 对每个样本,选择该样本中最常被攻击的Agent作为故障Agent
-        faulty_agent_indices = th.zeros(batch_size, dtype=th.long, device=self.device)
-        for b in range(batch_size):
-            victim_counts = th.bincount(victim_ids[b].long(), minlength=n_agents+1)[:n_agents]
-            if victim_counts.sum() > 0:  # 有实际攻击发生
-                faulty_agent_indices[b] = victim_counts.argmax()
-            else:  # 该样本中没有攻击,随机选择
-                faulty_agent_indices[b] = th.randint(0, n_agents, (1,), device=self.device)
-        
-        # 计算正常情况下的 Agent Q 值
-        pop_genome.init_hidden(batch.batch_size)
-        normal_agent_q_list = []
-        
-        with th.no_grad():
-            for t in range(batch.max_seq_length):
-                agent_out = pop_genome.forward(batch, t=t)  # min(q1, q2)
-                normal_agent_q_list.append(agent_out)
-        
-        normal_agent_q = th.stack(normal_agent_q_list, dim=1)
-        normal_chosen_q = th.gather(normal_agent_q[:, :-1], dim=3, index=actions).squeeze(3)
-        
-        # 注入故障
-        faulty_chosen_q = normal_chosen_q.clone()
-        fault_type = getattr(self.args, 'consensus_fault_type', 'worst')
-        
-        for b in range(batch_size):
-            k = faulty_agent_indices[b].item()
-            if fault_type == 'worst':
-                min_q = normal_chosen_q[b, :, k].min()
-                faulty_chosen_q[b, :, k] = min_q
-            elif fault_type == 'random':
-                noise = th.randn_like(faulty_chosen_q[b, :, k]) * 0.5
-                faulty_chosen_q[b, :, k] = normal_chosen_q[b, :, k] + noise
-            else:  # 'zero'
-                faulty_chosen_q[b, :, k] = 0.0
-        
-        # === Step 2: 计算当前 Genome 在故障场景下的 Q_tot ===
-        with th.no_grad():
-            my_faulty_global_q = self.mixer(faulty_chosen_q, batch["state"][:, :-1])
-        
-        # === Step 3: 计算精英种群在相同故障场景下的平均 Q_tot ===
-        K = min(len(elite_indices), getattr(self.args, 'consensus_elite_size', 3))
-        
-        if K == 0 or genome_index in elite_indices[:K]:
-            # 如果没有精英或自己就是精英，返回 0（无惩罚）
-            return th.tensor(0.0, device=self.device)
-        
-        elite_faulty_global_qs = []
-        for elite_idx in elite_indices[:K]:
-            if elite_idx == genome_index:
-                continue
-            
-            elite_genome = self.pop_genome[elite_idx]
-            elite_genome.eval()
-            
-            with th.no_grad():
-                # 使用相同的故障场景评估精英
-                elite_faulty_global_q = self.mixer(faulty_chosen_q, batch["state"][:, :-1])
-            elite_faulty_global_qs.append(elite_faulty_global_q)
-        
-        if len(elite_faulty_global_qs) == 0:
-            return th.tensor(0.0, device=self.device)
-        
-        # 计算精英平均判断（群体智慧）
-        elite_avg_faulty_q = th.stack(elite_faulty_global_qs, dim=0).mean(dim=0)
-        
-        # === Step 4: 计算共识偏离度 ===
-        deviation = th.abs(my_faulty_global_q - elite_avg_faulty_q)
-        masked_deviation = deviation * mask
-        mean_deviation = masked_deviation.sum() / (mask.sum() + 1e-8)
-        
-        # 返回负值（偏离越小，fitness 越高）
-        # TEVC 亮点：利用 Swarm Intelligence 来校准个体的鲁棒性判断
-        return -mean_deviation
-    
-    def calculate_adversarial_novelty(self, batch, genome_index):
-        """
-        机制三：基于权重分布的新颖性搜索 (Weighting-Pattern Novelty)
-        
-        **痛点**: 所有 Mixer 可能收敛到同一种平庸的防御策略（如简单平均）
-        **解决方案**: Quality-Diversity (QD) - 鼓励探索不同的权力分配结构
-        
-        提取 Mixer 的权重分配模式作为行为描述符，计算与历史精英存档的距离。
-        有的 Mixer 可能集权防御（某些 Agent 权重大），有的分权防御（均衡分配）。
-        
-        行为描述符: Mixer 在一批数据上产生的影响力分布向量 I ∈ R^N
-        新颖性得分: avg_distance(I_me, I_archive)
-        
-        Args:
-            batch: EpisodeBatch containing experience data
-            genome_index: 当前评估的 Genome 索引
-            
-        Returns:
-            novelty_score: 与存档的平均距离（越高=越新颖，fitness 越好）
-        """
-        # 获取当前评估的 Genome
-        pop_genome = self.pop_genome[genome_index]
-        
-        # 获取 mask
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["filled"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        actions = batch["actions"][:, :-1]
-        
-        # 设置为 eval 模式
-        pop_genome.eval()
-        
-        # === Step 1: 计算基准 Agent Q 值 ===
-        pop_genome.init_hidden(batch.batch_size)
-        agent_q_list = []
-        
-        with th.no_grad():
-            for t in range(batch.max_seq_length):
-                agent_out = pop_genome.forward(batch, t=t)
-                agent_q_list.append(agent_out)
-        
-        agent_q = th.stack(agent_q_list, dim=1)
-        chosen_q = th.gather(agent_q[:, :-1], dim=3, index=actions).squeeze(3)
-        
-        # 基准 Global Q
-        with th.no_grad():
-            baseline_global_q = self.mixer(chosen_q, batch["state"][:, :-1])
-        
-        # === Step 2: 提取权重分配模式（影响力分布）作为行为描述符 ===
-        n_agents = self.args.n_agents
-        delta = getattr(self.args, 'novelty_delta', 0.1)
-        
-        influences = []
-        
-        for k in range(n_agents):
-            # 对 Agent k 的 Q 值添加扰动
-            perturbed_q = chosen_q.clone()
-            perturbed_q[:, :, k] = perturbed_q[:, :, k] + delta
-            
-            # 计算扰动后的 Global Q
-            with th.no_grad():
-                perturbed_global_q = self.mixer(perturbed_q, batch["state"][:, :-1])
-            
-            # 影响力 I_k = |Q_tot(Q_k+δ) - Q_tot(Q_k)|
-            influence_k = th.abs(perturbed_global_q - baseline_global_q).squeeze(-1)
-            influences.append(influence_k)
-        
-        # Stack: (n_agents, batch, seq_len-1) -> transpose to (batch, seq_len-1, n_agents)
-        influences_tensor = th.stack(influences, dim=0)  # (n_agents, batch, seq_len-1)
-        influences_tensor = influences_tensor.permute(1, 2, 0)  # (batch, seq_len-1, n_agents)
-        
-        # 对时间和 batch 维度取平均，得到行为描述符
-        # behavior_descriptor: (n_agents,) - 每个 Agent 的平均影响力
-        masked_influences = influences_tensor * mask  # (batch, seq_len-1, n_agents) * (batch, seq_len-1, 1)
-        behavior_me = masked_influences.sum(dim=(0, 1)) / (mask.sum() + 1e-8)  # Sum over batch and time
-        
-        # 归一化为概率分布（权重分配模式）
-        behavior_me = behavior_me / (behavior_me.sum() + 1e-8)
-        
-        # === Step 3: 计算与存档的距离（新颖性） ===
-        if len(self.elite_archive) == 0:
-            # 空存档：最大新颖度
-            return th.tensor(1.0, device=self.device)
-        
-        distances = []
-        for archived_behavior in self.elite_archive:
-            # 使用欧氏距离度量权重分配模式的差异
-            dist = th.norm(behavior_me - archived_behavior, p=2)
-            distances.append(dist)
-        
-        distances_tensor = th.stack(distances, dim=0)
-        
-        # K 近邻距离
-        K = min(self.novelty_k_nearest, len(self.elite_archive))
-        knn_distances, _ = th.topk(distances_tensor, K, largest=False)
-        
-        # 新颖度 = K 近邻的平均距离
-        novelty_score = knn_distances.mean()
-        
-        # TEVC 亮点：Quality-Diversity - 防止种群陷入局部最优
-        # 鼓励 Mixer 探索不同的权力分配结构（集权 vs 分权）
-        return novelty_score
-    
-    def _js_divergence(self, p, q):
-        """
-        Compute Jensen-Shannon divergence between two distributions.
-        JS(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M), where M = (P+Q)/2
-        
-        Args:
-            p, q: Probability distributions, shape (batch, n_actions)
-            
-        Returns:
-            js_div: JS divergence for each batch element, shape (batch,)
-        """
-        # Ensure valid probabilities
-        p = p + 1e-8
-        q = q + 1e-8
-        p = p / p.sum(dim=-1, keepdim=True)
-        q = q / q.sum(dim=-1, keepdim=True)
-        
-        # Mixture distribution
-        m = 0.5 * (p + q)
-        
-        # KL divergences
-        kl_pm = (p * (th.log(p) - th.log(m))).sum(dim=-1)
-        kl_qm = (q * (th.log(q) - th.log(m))).sum(dim=-1)
-        
-        # JS divergence
-        js_div = 0.5 * kl_pm + 0.5 * kl_qm
-        
-        return js_div
-    
-    def update_elite_archive(self, elite_indices, batch):
-        """
-        更新精英存档（用于新颖性搜索）
-        存储 Genome 的权重分配模式（影响力分布）作为行为特征
-        
-        Args:
-            elite_indices: 精英 Genome 索引列表
-            batch: EpisodeBatch 用于计算行为描述符
-        """
-        # 获取 mask
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["filled"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        actions = batch["actions"][:, :-1]
-        
-        n_agents = self.args.n_agents
-        delta = getattr(self.args, 'novelty_delta', 0.1)
-        
-        # 为每个精英 Genome 计算行为描述符（权重分配模式）
-        for elite_idx in elite_indices[:min(len(elite_indices), 5)]:  # Top-5 精英
-            elite_genome = self.pop_genome[elite_idx]
-            elite_genome.eval()
-            
-            # 计算 Agent Q 值
-            elite_genome.init_hidden(batch.batch_size)
-            agent_q_list = []
-            
-            with th.no_grad():
-                for t in range(batch.max_seq_length):
-                    agent_out = elite_genome.forward(batch, t=t)
-                    agent_q_list.append(agent_out)
-            
-            agent_q = th.stack(agent_q_list, dim=1)
-            chosen_q = th.gather(agent_q[:, :-1], dim=3, index=actions).squeeze(3)
-            
-            # 基准 Global Q
-            with th.no_grad():
-                baseline_global_q = self.mixer(chosen_q, batch["state"][:, :-1])
-            
-            # 计算每个 Agent 的影响力
-            influences = []
-            for k in range(n_agents):
-                perturbed_q = chosen_q.clone()
-                perturbed_q[:, :, k] = perturbed_q[:, :, k] + delta
-                
-                with th.no_grad():
-                    perturbed_global_q = self.mixer(perturbed_q, batch["state"][:, :-1])
-                
-                influence_k = th.abs(perturbed_global_q - baseline_global_q).squeeze(-1)
-                influences.append(influence_k)
-            
-            influences_tensor = th.stack(influences, dim=0)  # (n_agents, batch, seq_len-1)
-            influences_tensor = influences_tensor.permute(1, 2, 0)  # (batch, seq_len-1, n_agents)
-            
-            # 行为描述符：每个 Agent 的平均影响力（权重分配模式）
-            masked_influences = influences_tensor * mask  # (batch, seq_len-1, n_agents) * (batch, seq_len-1, 1)
-            behavior = masked_influences.sum(dim=(0, 1)) / (mask.sum() + 1e-8)  # Sum over batch and time
-            
-            # 归一化为概率分布
-            behavior = behavior / (behavior.sum() + 1e-8)
-            
-            # 添加到存档
-            self.elite_archive.append(behavior.detach().clone())
-        
-        # 维护存档大小（FIFO）
-        if len(self.elite_archive) > self.archive_max_size:
-            self.elite_archive = self.elite_archive[-self.archive_max_size:]
-        
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, per_weight=None):
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1] # the total reward
@@ -981,6 +499,22 @@ class MARCOLearner:
     
     def lamarckian_finetune(self, pop_genome, batch, num_sgd_steps=1):
         """
+        DEPRECATED: This function is kept for backward compatibility only.
+        According to MACO_overview.md V6 refactoring, explicit memetic learning is REMOVED.
+        
+        Rationale from document:
+        "我们可以novel一些，不再说'memetic learning' 而是'memetic injection模因注入/文化注入'。
+        然后去掉原本的memetic learning的过程。"
+        
+        The main agent learning (train()) itself IS the implicit memetic mechanism:
+        - Main agent learns via SGD (TD error minimization)
+        - Parameters are injected to replace dominated individuals (memetic injection)
+        - This is equivalent to Value-Evolutionary-Based Reinforcement Learning
+        
+        DO NOT CALL THIS FUNCTION IN NEW CODE.
+        Use only: rl_to_evo_excluding_elites() for parameter injection.
+        
+        Original description:
         Lamarckian SGD Injection: 对种群中的单个 Genome 进行 SGD 微调。
         
         **Lamarckian 特性**: 微调直接修改个体的权重（基因），因此获得的改进会遗传给后代。
@@ -1172,11 +706,26 @@ class MARCOLearner:
     # ========== Attacker Fitness Calculation ==========
     def calculate_attacker_quality(self, batch, attacker_idx, population_attackers):
         """
+        DEPRECATED: This function is no longer used in run.py (V6 refactoring).
+        
+        The correct approach is to run environment with EACH attacker separately in run.py:
+        ```python
+        genome.mac1.set_attacker(population_attackers[i])
+        attacker_eval_batch = runner.run(genome, test_mode=False)
+        quality = -attacker_eval_batch["reward"].mean()
+        ```
+        
+        Kept for backward compatibility only.
+        
+        Original (incorrect) implementation:
         Calculate attack quality: negative mean episode return (lower defender reward = better).
         
+        Problem: This function computed quality from a shared batch, causing all attackers
+        to have identical quality values. Fixed in V6 by running separate evaluations.
+        
         Args:
-            batch: Episode batch data
-            attacker_idx: Index of attacker in population
+            batch: Episode batch data (SHARED - this was the bug!)
+            attacker_idx: Index of attacker in population (unused - this was the bug!)
             population_attackers: List of all attacker instances
             
         Returns:
@@ -1192,34 +741,187 @@ class MARCOLearner:
         
         return mean_return
     
-    def calculate_attacker_efficiency(self, batch, attacker_idx, population_attackers):
+    def calculate_attacker_TD_error(self, batch: EpisodeBatch, attacker_idx: int, population_attackers):
         """
-        Calculate attack efficiency: mean attack count (lower is more efficient).
+        CORRECTED V6: Calculate attacker fitness via TD Error maximization with COUNTERFACTUAL ACTIONS.
+        
+        Mathematical Foundation:
+        F_att,1(φ) = E_τ~D_φ [(y - Q_tot(s, a_φ))²]
+        
+        Where:
+        - y: TD target (computed from clean target network)
+        - a_φ: Counterfactual actions under attacker φ's Byzantine interference
+        - Attacker φ selects victims and replaces their actions with Byzantine (worst) actions
+        - Different attackers → different victim selections → different action sequences → different Q-values
+        
+        KEY INSIGHT (Byzantine Attack Model):
+        - Attacker does NOT perturb observations (ũ_φ)
+        - Attacker perturbs ACTIONS via victim selection
+        - We use batch's existing `byzantine_actions` but apply attacker-specific victim masks
+        
+        CRITICAL FIX: 
+        - Previous version used batch["actions"] which were collected WITHOUT this attacker
+        - Now we construct counterfactual actions: apply THIS attacker's victim selection to batch
+        - This makes different attackers produce DIFFERENT TD errors (different victims → different actions)
+        
+        Computational Efficiency:
+        1. No environment rollout needed (offline batch computation)
+        2. Reuse batch's `byzantine_actions` (pre-computed worst actions)
+        3. Only recompute victim selection (cheap: attacker.batch_forward())
         
         Args:
-            batch: Episode batch data
-            attacker_idx: Index of attacker in population
+            batch: EpisodeBatch from replay buffer
+                   Must contain: actions, byzantine_actions, obs, state, reward, terminated
+            attacker_idx: Index of attacker to evaluate
             population_attackers: List of all attacker instances
             
         Returns:
-            mean_attack_count: Mean number of attacks used (scalar tensor)
+            td_error: Mean TD error under this attacker's Byzantine interference
+                     Higher value = better attacker (more disruptive)
         """
-        # Extract attack budget usage from batch
-        # Assuming "left_attack" tracks remaining budget (initial - used)
-        left_attack = batch["left_attack"][:, :-1]  # [batch_size, T, 1]
+        # Get the attacker to evaluate
+        attacker = population_attackers[attacker_idx]
+        attacker.eval()
+        
+        # === Step 0: Construct counterfactual actions using THIS attacker's victim selection ===
+        # Byzantine attack: attacker selects which agents to attack, then replaces their actions
+        batch_size = batch.batch_size
+        seq_len = batch.max_seq_length
+        n_agents = self.args.n_agents
+        
+        # Get base actions and Byzantine actions from batch
+        original_actions = batch["actions"]  # [bs, seq, n_agents, 1]
+        byzantine_actions = batch["byzantine_actions"]  # [bs, seq, n_agents, 1]
+        
+        # Use THIS attacker to select victims for each timestep
+        # attacker.batch_forward() returns logits over (n_agents + 1) actions
+        # where index i means "attack agent i", index n_agents means "no attack"
+        counterfactual_actions = original_actions.clone()  # Start with original actions
+        
+        with th.no_grad():
+            for t in range(seq_len):
+                # Get attacker's victim selection at timestep t
+                attacker_logits = attacker.batch_forward(batch, t)  # [bs, n_agents+1]
+                victim_id = attacker_logits.argmax(dim=1)  # [bs] - which agent to attack
+                
+                # Apply Byzantine attack: replace victim's action with Byzantine action
+                for b in range(batch_size):
+                    victim = victim_id[b].item()
+                    if victim < n_agents:  # Valid agent (not "no attack")
+                        # Replace this agent's action with Byzantine action
+                        counterfactual_actions[b, t, victim] = byzantine_actions[b, t, victim]
+        
+        # Get the relevant quantities
+        rewards = batch["reward"][:, :-1]
+        actions_counterfactual = counterfactual_actions[:, :-1]  # Use counterfactual actions!
+        terminated = batch["terminated"][:, :-1].float()
         mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        avail_actions = batch["avail_actions"]
         
-        # Compute attacks used = initial_budget - min(left_attack)
-        # Assuming initial budget is stored in args
-        initial_budget = self.args.num_attack_train
+        # Set to eval mode for evaluation (no dropout, no exploration)
+        self.Genome.eval()
         
-        # Get minimum remaining budget per episode (final budget)
-        final_budget = left_attack[:, -1]  # [batch_size, 1]
-        attacks_used = initial_budget - final_budget  # [batch_size, 1]
+        with th.no_grad():
+            # === Step 1: Forward pass to get Q-values ===
+            # NOTE: We DON'T set attacker on MACs because Byzantine attack affects ACTIONS, not observations
+            # The disruption comes from counterfactual_actions, not from perturbed observations
+            
+            # Calculate Q-Values using mac1
+            mac_out_1 = []
+            self.Genome.mac1.init_hidden(batch.batch_size)
+            for t in range(batch.max_seq_length):
+                agent_outs = self.Genome.mac1.forward(batch, t=t)
+                mac_out_1.append(agent_outs)
+            mac_out_1 = th.stack(mac_out_1, dim=1)
+            
+            # Calculate Q-Values using mac2
+            mac_out_2 = []
+            self.Genome.mac2.init_hidden(batch.batch_size)
+            for t in range(batch.max_seq_length):
+                agent_outs = self.Genome.mac2.forward(batch, t=t)
+                mac_out_2.append(agent_outs)
+            mac_out_2 = th.stack(mac_out_2, dim=1)
         
-        mean_attack_count = attacks_used.mean()
+        # Pick Q-Values for the COUNTERFACTUAL actions (attacker-perturbed actions)
+        # This is the key: different attackers → different victim selections → different counterfactual actions
+        chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions_counterfactual).squeeze(3)
+        chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions_counterfactual).squeeze(3)
         
-        return mean_attack_count
+        # === Step 2: Calculate TD targets (using target network with clean actions) ===
+        # Target network uses ORIGINAL actions (not counterfactual)
+        # This measures how much attacker's action perturbation disrupts Q-value accuracy
+        with th.no_grad():
+            self.target_Genome.eval()
+            
+            # Target Q-values from target_Genome
+            target_mac_out = []
+            self.target_Genome.init_hidden(batch.batch_size)
+            for t in range(batch.max_seq_length):
+                target_agent_outs = self.target_Genome.forward(batch, t=t)
+                target_mac_out.append(target_agent_outs)
+
+            target_mac_out = th.stack(target_mac_out, dim=1)
+
+            # Double Q-learning: use current network for action selection
+            mac_out_combined = th.min(mac_out_1, mac_out_2)
+            mac_out_detach = mac_out_combined.clone().detach()
+            mac_out_detach[avail_actions == 0] = -9999999
+            cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
+            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
+            
+            # Calculate n-step Q-Learning targets 
+            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"])
+
+            if getattr(self.args, 'q_lambda', False):
+                qvals = th.gather(target_mac_out, 3, batch["actions"]).squeeze(3)
+                qvals = self.target_mixer(qvals, batch["state"])
+
+                targets = build_q_lambda_targets(rewards, terminated, mask, target_max_qvals, qvals,
+                                    self.args.gamma, self.args.td_lambda)
+            else:
+                targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
+                                                    self.args.n_agents, self.args.gamma, self.args.td_lambda)
+
+        # === Step 3: Apply mixer and compute TD error ===
+        with th.no_grad():
+            chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
+            chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
+
+        # Calculate TD error for both MACs
+        td_error_1 = (chosen_action_qvals_1 - targets.detach())
+        td_error2_1 = 0.5 * td_error_1.pow(2)
+        
+        td_error_2 = (chosen_action_qvals_2 - targets.detach())
+        td_error2_2 = 0.5 * td_error_2.pow(2)
+
+        mask_expanded = mask.expand_as(td_error2_1)
+        masked_td_error_1 = td_error2_1 * mask_expanded
+        masked_td_error_2 = td_error2_2 * mask_expanded
+
+        # Average TD errors from both MACs
+        mean_td_error_1 = masked_td_error_1.sum() / (mask_expanded.sum() + 1e-8)
+        mean_td_error_2 = masked_td_error_2.sum() / (mask_expanded.sum() + 1e-8)
+        mean_td_error = (mean_td_error_1 + mean_td_error_2) / 2.0
+        
+        # Safety check: if TD error is unreasonably large, cap it
+        if mean_td_error.item() > 1e6:
+            return th.tensor(1e6, device=mean_td_error.device)
+        
+        # Return TD error (higher = better for attacker, as it means more disruption)
+        return mean_td_error
+    
+    # ========== REMOVED: calculate_attacker_efficiency ==========
+    # "原来的3个目标去除掉efficiency，因为实际会导致完全不攻击。
+    # （一点预算都不用，就是最高效的，不会被pareto支配）"
+    #
+    # Efficiency leads to no attacks at all (zero budget = maximum efficiency),
+    # which defeats the purpose of adversarial training.
+    #
+    # Attacker Fitness (2 objectives only):
+    # 1. Quality: Negative defender reward (calculate_attacker_quality)
+    # 2. Novelty: Attack pattern diversity (calculate_attacker_behavioral_novelty)
+    # =================================================================
 
     # ========== Attacker Novelty Calculation ==========
     def calculate_attacker_behavioral_novelty(self, batch, attacker_idx, elite_attackers, population_attackers):
@@ -1361,18 +1063,21 @@ class MARCOLearner:
         
         return total_distance.item()
     
-    # ========== Attacker Lamarckian SGD Finetuning ==========
+    # ========== Attacker Memetic SGD Training (NEW APPROACH) ==========
     def lamarckian_finetune_attacker(self, attacker, episode_batch, num_sgd_steps=1):
         """
-        Lamarckian SGD微调for Attacker: 沿着quality目标(negative defender reward)进行梯度下降。
+        REFACTORED: Memetic SGD for Attacker using Budget-Modulated Attack Advantage.
+        Replaces old Soft Q-Learning with policy gradient-like approach.
         
-        与defender的Lamarckian不同:
-        - Defender优化: 最小化TD error (拟合环境)
-        - Attacker优化: 最大化negative reward (破坏defender性能)
+        New Training Mechanism (MACO_overview.md V6):
+        1. Attack Advantage Function: A_att(j|s,k) = Q_j(s,u_j) - γ(k)·Q̄(s)
+        2. Budget Modulation: γ(k) = 1 + budget_lambda(K-k)/K (higher threshold when budget is scarce)
+        3. Policy Gradient Loss: L_att = -E[Σ A_att(j)·log π(j)]
         
-        训练目标:
-        1. 主要: 最小化 defender reward (即最大化 -reward)
-        2. 辅助: 保持Soft Q-Learning的策略稀疏性
+        Key Innovation:
+        - Teaches attacker "opportunity cost awareness" (好钢用在刀刃上)
+        - When budget is low, only attack high-value targets
+        - When budget is high, attack above-average targets
         
         Args:
             attacker: MLPAttacker instance to finetune
@@ -1380,12 +1085,12 @@ class MARCOLearner:
             num_sgd_steps: Number of SGD steps to perform
             
         Returns:
-            final_loss: Final quality loss value (for monitoring)
+            final_loss: Final loss value (for monitoring)
         """
-        # 1. 设置为训练模式
+        # 1. Set to train mode
         attacker.train()
         
-        # 2. 创建临时优化器 (使用较小学习率，避免破坏进化得到的权重)
+        # 2. Create temporary optimizer (conservative learning rate)
         finetune_lr = getattr(self.args, 'attacker_finetune_lr', self.args.attack_lr * 0.1)
         finetune_optimizer = th.optim.RMSprop(
             attacker.parameters(), 
@@ -1394,80 +1099,194 @@ class MARCOLearner:
             eps=self.args.optim_eps
         )
         
-        # 准备batch
+        # Prepare batch
         max_ep_t = episode_batch.max_t_filled()
         batch = episode_batch[:, :max_ep_t]
         
         if batch.device != self.args.device:
             batch.to(self.args.device)
         
-        # 提取数据
+        # Extract data
         rewards = batch["reward"][:, :-1]  # Defender's reward
-        # if self.args.shaping_reward:
-        #     rewards = batch["shaping_reward"][:, :-1]
-        
         terminated = batch["terminated"][:, :-1].float()
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        left_attack = batch["left_attack"][:, :-1]  # Remaining budget k
         
-        # 3. 执行多步SGD微调
+        # Get attack budget K
+        K = getattr(self.args, 'attack_num', 10)
+        budget_lambda = getattr(self.args, 'budget_lambda', 1.0)  # Budget modulation strength
+        
+        # 3. Multi-step SGD finetuning
         for step in range(num_sgd_steps):
-            # Forward pass: 计算attacker的Q值
-            attacker_qs = []
+            # === Step 1: Get defender's local Q-values for all agents ===
+            # We need Q_j(s, u_j) for each agent j to compute attack advantage
+            # Use the main RL genome to get Q-values
+            self.Genome.eval()
+            self.Genome.init_hidden(batch.batch_size)
+            
+            agent_q_list = []
+            with th.no_grad():
+                for t in range(batch.max_seq_length):
+                    agent_q = self.Genome.forward(batch, t=t)  # (bs, n_agents, n_actions)
+                    agent_q_list.append(agent_q)
+            
+            agent_q = th.stack(agent_q_list, dim=1)[:, :-1]  # (bs, seq_len-1, n_agents, n_actions)
+            
+            # Get Q-values for executed actions
+            actions = batch["actions"][:, :-1]  # (bs, seq_len-1, n_agents, 1)
+            chosen_q = th.gather(agent_q, dim=3, index=actions).squeeze(3)  # (bs, seq_len-1, n_agents)
+            
+            # === Step 2: Compute Attack Advantage ===
+            # Average Q across all agents: Q̄(s) = (1/N) Σ Q_j(s, u_j)
+            Q_bar = chosen_q.mean(dim=2, keepdim=True)  # (bs, seq_len-1, 1)
+            
+            # Budget modulation factor: γ(k) = 1 + budget_lambda(K-k)/K
+            gamma_k = 1.0 + budget_lambda * (K - left_attack) / K  # (bs, seq_len-1, 1)
+            
+            # Attack Advantage for each agent j: A_att(j) = Q_j - γ(k)·Q̄
+            attack_advantage = chosen_q - gamma_k * Q_bar  # (bs, seq_len-1, n_agents)
+            
+            # For "no-attack" option (j=N+1), advantage is 0
+            no_attack_advantage = th.zeros_like(attack_advantage[:, :, :1])  # (bs, seq_len-1, 1)
+            attack_advantage_full = th.cat([attack_advantage, no_attack_advantage], dim=2)  # (bs, seq_len-1, n_agents+1)
+            
+            # === Step 3: Get attacker's action probabilities ===
+            attacker_logits = []
             for t in range(batch.max_seq_length):
-                attacker_q = attacker.batch_forward(batch, t=t)
-                attacker_qs.append(attacker_q)
-            attacker_qs = th.stack(attacker_qs, dim=1)  # (bs, seq_len, n_agents+1)
+                logit = attacker.batch_forward(batch, t=t)
+                attacker_logits.append(logit)
+            attacker_logits = th.stack(attacker_logits, dim=1)[:, :-1]  # (bs, seq_len-1, n_agents+1)
             
-            # === Quality Objective: Maximize negative defender reward ===
-            # 策略: 选择能最大化负reward的victim
-            # 使用softmax得到victim选择概率分布
-            victim_logits = attacker_qs[:, :-1]  # (bs, seq_len-1, n_agents+1)
-            victim_probs = th.softmax(victim_logits, dim=-1)  # Temperature=0.1 for sharper distribution
+            # Convert to log probabilities
+            log_probs = th.log_softmax(attacker_logits, dim=-1)  # (bs, seq_len-1, n_agents+1)
             
-            # 计算期望的victim选择下的reward
-            # 假设: 选择不同victim会导致不同的reward
-            # 简化为: 最大化选择"攻击"行为(非no-attack)的概率
-            attack_prob = 1.0 - victim_probs[:, :, -1]  # Probability of NOT choosing "no-attack"
+            # === Step 4: Policy Gradient Loss ===
+            # L_att = -E[Σ_j A_att(j) · log π(j)]
+            # If A_att(j) > 0: High advantage → increase log π(j)  
+            # If A_att(j) < 0: Low advantage → decrease log π(j)
+            policy_loss = -(attack_advantage_full * log_probs * mask).sum() / mask.sum()
             
-            # Quality loss: 最小化defender reward，加权于攻击概率
-            # L_quality = E[reward * attack_prob] = 期望的defender损失
-            quality_loss = -(rewards.squeeze(-1) * attack_prob * mask.squeeze(-1)).sum() / mask.sum()
-            
-            # === Regularization: Soft Q-Learning稀疏性约束 ===
-            # 保持与p_ref的一致性，防止过度偏离稀疏攻击策略
-            # KL散度: D_KL(victim_probs || p_ref)
-            p_ref_expanded = attacker.p_ref.unsqueeze(0).unsqueeze(0).expand_as(victim_probs)
-            kl_div = (victim_probs * (th.log(victim_probs + 1e-8) - th.log(p_ref_expanded + 1e-8))).sum(dim=-1)
-            
-            reg_weight = getattr(self.args, 'attacker_finetune_reg', 0.01)
-            reg_loss = (kl_div * mask.squeeze(-1)).sum() / (mask.sum() + 1e-8)
-            
-            # Total loss
-            total_loss = quality_loss + reg_weight * reg_loss
-            
-            # 检查loss是否合理
-            if not th.isfinite(total_loss):
-                # Loss异常，停止微调
+            # Check if loss is valid
+            if not th.isfinite(policy_loss):
                 return float('inf')
             
             # Backward and optimize
             finetune_optimizer.zero_grad()
-            total_loss.backward()
-            
-            # 梯度裁剪 (更保守)
-            grad_clip = getattr(self.args, 'attacker_finetune_grad_clip', self.args.grad_norm_clip * 0.5)
-            grad_norm = th.nn.utils.clip_grad_norm_(attacker.parameters(), grad_clip)
-            
-            # 检查梯度
-            if not th.isfinite(grad_norm):
-                finetune_optimizer.zero_grad()
-                return float('inf')
-            
+            policy_loss.backward()
+            grad_norm = th.nn.utils.clip_grad_norm_(attacker.parameters(), self.args.grad_norm_clip)
             finetune_optimizer.step()
         
-        # 4. 设置回eval模式
-        attacker.eval()
+        # 4. Return final loss for monitoring
+        return policy_loss.item()
+    
+    # ========== DEPRECATED: Old Lamarckian Attacker Training ==========
+    # def _lamarckian_finetune_attacker_OLD_DEPRECATED(self, attacker, episode_batch, num_sgd_steps=1):
+    #     """
+    #     DEPRECATED: Old Lamarckian SGD微调for Attacker (replaced by budget-modulated advantage).
         
-        # 5. 返回最终loss (主要是quality loss)
-        return quality_loss.item()
+    #     与defender的Lamarckian不同:
+    #     - Defender优化: 最小化TD error (拟合环境)
+    #     - Attacker优化: 最大化negative reward (破坏defender性能)
+        
+    #     训练目标:
+    #     1. 主要: 最小化 defender reward (即最大化 -reward)
+    #     2. 辅助: 保持Soft Q-Learning的策略稀疏性
+        
+    #     Args:
+    #         attacker: MLPAttacker instance to finetune
+    #         episode_batch: Recent episode batch for computing gradient
+    #         num_sgd_steps: Number of SGD steps to perform
+            
+    #     Returns:
+    #         final_loss: Final quality loss value (for monitoring)
+    #     """
+    #     # 1. 设置为训练模式
+    #     attacker.train()
+        
+    #     # 2. 创建临时优化器 (使用较小学习率，避免破坏进化得到的权重)
+    #     finetune_lr = getattr(self.args, 'attacker_finetune_lr', self.args.attack_lr * 0.1)
+    #     finetune_optimizer = th.optim.RMSprop(
+    #         attacker.parameters(), 
+    #         lr=finetune_lr,
+    #         alpha=self.args.optim_alpha, 
+    #         eps=self.args.optim_eps
+    #     )
+        
+    #     # 准备batch
+    #     max_ep_t = episode_batch.max_t_filled()
+    #     batch = episode_batch[:, :max_ep_t]
+        
+    #     if batch.device != self.args.device:
+    #         batch.to(self.args.device)
+        
+    #     # 提取数据
+    #     rewards = batch["reward"][:, :-1]  # Defender's reward
+    #     # if self.args.shaping_reward:
+    #     #     rewards = batch["shaping_reward"][:, :-1]
+        
+    #     terminated = batch["terminated"][:, :-1].float()
+    #     mask = batch["filled"][:, :-1].float()
+    #     mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        
+    #     # 3. 执行多步SGD微调
+    #     for step in range(num_sgd_steps):
+    #         # Forward pass: 计算attacker的Q值
+    #         attacker_qs = []
+    #         for t in range(batch.max_seq_length):
+    #             attacker_q = attacker.batch_forward(batch, t=t)
+    #             attacker_qs.append(attacker_q)
+    #         attacker_qs = th.stack(attacker_qs, dim=1)  # (bs, seq_len, n_agents+1)
+            
+    #         # === Quality Objective: Maximize negative defender reward ===
+    #         # 策略: 选择能最大化负reward的victim
+    #         # 使用softmax得到victim选择概率分布
+    #         victim_logits = attacker_qs[:, :-1]  # (bs, seq_len-1, n_agents+1)
+    #         victim_probs = th.softmax(victim_logits, dim=-1)  # Temperature=0.1 for sharper distribution
+            
+    #         # 计算期望的victim选择下的reward
+    #         # 假设: 选择不同victim会导致不同的reward
+    #         # 简化为: 最大化选择"攻击"行为(非no-attack)的概率
+    #         attack_prob = 1.0 - victim_probs[:, :, -1]  # Probability of NOT choosing "no-attack"
+            
+    #         # Quality loss: 最小化defender reward，加权于攻击概率
+    #         # L_quality = E[reward * attack_prob] = 期望的defender损失
+    #         quality_loss = -(rewards.squeeze(-1) * attack_prob * mask.squeeze(-1)).sum() / mask.sum()
+            
+    #         # === Regularization: Soft Q-Learning稀疏性约束 ===
+    #         # 保持与p_ref的一致性，防止过度偏离稀疏攻击策略
+    #         # KL散度: D_KL(victim_probs || p_ref)
+    #         p_ref_expanded = attacker.p_ref.unsqueeze(0).unsqueeze(0).expand_as(victim_probs)
+    #         kl_div = (victim_probs * (th.log(victim_probs + 1e-8) - th.log(p_ref_expanded + 1e-8))).sum(dim=-1)
+            
+    #         reg_weight = getattr(self.args, 'attacker_finetune_reg', 0.01)
+    #         reg_loss = (kl_div * mask.squeeze(-1)).sum() / (mask.sum() + 1e-8)
+            
+    #         # Total loss
+    #         total_loss = quality_loss + reg_weight * reg_loss
+            
+    #         # 检查loss是否合理
+    #         if not th.isfinite(total_loss):
+    #             # Loss异常，停止微调
+    #             return float('inf')
+            
+    #         # Backward and optimize
+    #         finetune_optimizer.zero_grad()
+    #         total_loss.backward()
+            
+    #         # 梯度裁剪 (更保守)
+    #         grad_clip = getattr(self.args, 'attacker_finetune_grad_clip', self.args.grad_norm_clip * 0.5)
+    #         grad_norm = th.nn.utils.clip_grad_norm_(attacker.parameters(), grad_clip)
+            
+    #         # 检查梯度
+    #         if not th.isfinite(grad_norm):
+    #             finetune_optimizer.zero_grad()
+    #             return float('inf')
+            
+    #         finetune_optimizer.step()
+        
+    #     # 4. 设置回eval模式
+    #     attacker.eval()
+        
+    #     # 5. 返回最终loss (主要是quality loss)
+    #     return quality_loss.item()

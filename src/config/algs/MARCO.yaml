@@ -43,103 +43,68 @@ per_alpha: 0.6
 per_beta: 0.4
 return_priority: False
 
+# ============================================================================
+# Evolution Settings
+# ============================================================================
+pop_size: 10                           # Defender population size
+elite_size: 0.2                        # Elite ratio for selection (20%)
 
-# --- Evolution settings ---
-pop_size: 10
-elite_size: 0.2
+# --- Defender Fitness (2 Objectives) ---
+# Objective 1 (Optimality): TD Error - minimize environment fitting error
+# Objective 2 (Robustness): Fault Isolation Ratio - minimize sensitivity to faults
+fault_type: "worst"                    # Byzantine fault type: "worst", "random", "zero"
 
-# --- Evolutionary Mechanisms ---
+# --- Learning-Assisted Dynamic Weighting ---
+# Adaptive curriculum: balance optimality vs robustness based on learning progress
+use_linear_alpha: True                 # Use linear ramp (True) or sigmoid (False)
+alpha_steepness: 10.0                  # Steepness for sigmoid transfer function
+alpha_center: 0.5                      # Center point for sigmoid
+alpha_start: 0.3                       # Start point for linear ramp
+alpha_end: 0.8                         # End point for linear ramp
+td_init_steps: 50                      # Steps to compute baseline TD_init
 
-# Mechanism 1: Twin Adversarial Confidence (Robustness Metric)
-use_twin_adversarial_confidence: True  # Use Twin-Q networks for robust confidence estimation
-adversarial_tau: 1.0                    # Boltzmann temperature for policy distribution (softmax temperature)
+# ============================================================================
+# Attacker Evolution Settings
+# ============================================================================
+attacker_pop_size: 20                  # Attacker population size
 
-# Mechanism 2: Evolutionary Consensus (Population-Level Robustness Calibration)
-use_evolutionary_consensus: True       # Enable population consensus metric (swarm intelligence)
-consensus_elite_size: 3                 # Number of elite agents for consensus calculation
-consensus_fault_type: "worst"           # Fault injection type for consensus: "worst", "random", "zero"
+# --- Attacker Fitness (2 Objectives) ---
+# Objective 1 (Quality): Negative defender reward - maximize damage
+# Objective 2 (Novelty): Behavioral diversity - explore attack space
 
-# Mechanism 3: Adversarial Behavioral Novelty (Quality-Diversity)
-use_adversarial_novelty: True          # Enable archive-based novelty search (prevent convergence)
-archive_max_size: 50                    # Maximum size of elite behavior archive
-novelty_k_nearest: 5                    # K for K-nearest neighbor novelty calculation
-novelty_delta: 0.1                      # Perturbation magnitude for influence calculation
+# --- Attack Budget & Advantage Function ---
+# New mechanism (V6): Budget-Modulated Attack Advantage
+# A_att(j|s,k) = Q_j(s,u_j) - γ(k)·Q̄(s)
+# γ(k) = 1 + λ(K-k)/K
+budget_lambda: 1.0                     # Budget modulation strength λ
+                                       # Higher = more conservative when budget low
+                                       # Recommended: 0.5-2.0
 
-# Mechanism 4: Byzantine Fault Tolerance - Fault Isolation Ratio
-fault_type: "worst"                     # Byzantine fault type: "worst", "random", "zero"
+# --- Attacker Memetic SGD (Policy Gradient with Attack Advantage) ---
+# REFACTORED: Uses attack advantage + policy gradient loss
+# L_att = -E[Σ A_att(j)·log π(j)]
+attacker_finetune_lr: 0.00002          # Learning rate for memetic SGD (attack_lr * 0.1)
+                                       # Conservative to avoid breaking evolved structure
 
-# Mechanism 5: Byzantine Fault Tolerance - Influence Constraint (Power Balance)
-influence_delta: 0.1                    # δ for measuring agent influence: Q_k → Q_k + δ
-influence_lambda: 0.5                   # λ weight for influence variance penalty
+# --- Attacker Parameters ---
+population_train_steps: 6              # Training steps per evolution generation
+individual_sample_episode: 4           # Episodes sampled per individual evaluation
+spare_lambda: 0.04                     # Sparsity parameter
+attack_batch_size: 10                  # Batch size for attacker training
+attacker_eval_num: 4                   # Number of episodes for attacker evaluation
+smoothing_factor: 0.02                 # Smoothing factor for attacker metrics
 
-# Learning-Assisted Dynamic Weighting (Adaptive Phase-specific Multi-Objective Optimization)
-use_linear_alpha: True                 # Use linear ramp (True) or sigmoid (False) for alpha_t
-alpha_steepness: 10.0                   # Steepness (k) of sigmoid for alpha_t transfer function
-alpha_center: 0.5                       # Center point (P_center) for sigmoid
-alpha_start: 0.3                        # Start point (P_start) for linear ramp
-alpha_end: 0.8                          # End point (P_end) for linear ramp
-td_init_steps: 50                       # Number of training steps to compute baseline TD_init
+one_buffer: True                       # Use single replay buffer for all attackers
+concat_left_time: True                 # Concatenate remaining budget to attacker state
+attack_lr: 0.0002                      # Base learning rate for attackers
+attacker_hidden_dim: 64                # Hidden dimension for attacker network
+attacker_soft_tau: 0.005               # Soft update parameter for attacker target network
+attack_agent_selector: "sparse"        # Action selector for attackers
 
-# Memetic Co-evolution (SGD Injection into Evolution)
-use_memetic_update: True                # Enable Memetic SGD update of elites
-num_memetic_elites: 3                   # Number of top elites to update with SGD
-memetic_update_steps: 1                 # Number of SGD steps per elite
-memetic_update_lr: 0.0001               # Learning rate for Memetic update (conservative)
-max_memetic_update_loss: 100.0          # Maximum loss threshold for update (prevent divergence)
-memetic_update_grad_clip: 5.0           # Gradient clipping for update (prevent explosion)
-
-# RL → Evolution Injection Strategy
-use_rl_injection: True                 # Enable legacy RL → Evo injection (replaced by new logic)
-
-# --- Attacker Memetic Update (Co-evolution Enhancement) ---
-# Enable gradient-based update for elite attackers to optimize quality objective
-# This creates an evolutionary arms race: defenders evolve robustness → attackers break defenses
-use_attacker_memetic_update: True       # Enable Memetic SGD update for elite attackers
-                                        # Optimizes quality (negative defender reward) objective
-                                        
-num_memetic_attackers: 3                # Number of top elite attackers to update
-                                        # Recommended: 3-5, more increases computation cost
-                                        # These are the best performers from Pareto front
-                                        
-attacker_memetic_update_steps: 1        # Number of SGD optimization steps per attacker
-                                        # 1-3 steps recommended to avoid overfitting
-                                        # More steps = stronger adaptation but potential overfitting
-                                        
-attacker_memetic_update_lr: 0.0001      # Learning rate for attacker update
-                                        # Default: attack_lr * 0.1 (conservative)
-                                        # Increase if quality loss decreases slowly
-                                        # Decrease if training becomes unstable
-                                        
-attacker_memetic_update_reg: 0.01       # Sparsity regularization weight (KL divergence)
-                                        # Controls victim selection diversity
-                                        # Higher = more sparse/stealthy attacks
-                                        # Lower = more aggressive attacks
-                                        
-attacker_memetic_update_grad_clip: 5.0  # Gradient clipping threshold for stability
-                                        # Default: grad_norm_clip * 0.5 (more conservative)
-                                        # Decrease if gradients explode (NaN/Inf)
-                                        # Prevents gradient explosion during update
-
-
-# --- Attacker parameters ---
-population_train_steps: 6
-individual_sample_episode: 4
-spare_lambda: 0.04
-attack_batch_size: 10
-attacker_eval_num: 4
-smoothing_factor: 0.02
-# shaping_reward: True
-one_buffer: True
-concat_left_time: True
-attack_lr: 0.0002
-attacker_hidden_dim: 64
-attacker_soft_tau: 0.005
-attack_agent_selector: "sparse"
-adversarial_training: True
-num_attack_train: 12
-num_attack_test: 10
-sparse_ref_delta: 0.05
-load_sparse_ref_delta: 0.05
-attacker_pop_size: 20
+adversarial_training: True             # Enable adversarial training
+num_attack_train: 12                   # Number of training attacks per episode
+num_attack_test: 10                    # Number of test attacks per episode
+sparse_ref_delta: 0.05                 # Delta for sparse reference distribution
+load_sparse_ref_delta: 0.05            # Delta for loading sparse reference
 
 name: "MARCO_env=8_adam_td_lambda"

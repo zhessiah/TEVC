@@ -39,8 +39,10 @@ class Robust_ParallelRunner:
 
         self.train_returns = []
         self.test_returns = []
+        self.test_under_attack_returns = []  # 新增：攻击下的测试returns
         self.train_stats = {}
         self.test_stats = {}
+        self.test_under_attack_stats = {}  # 新增：攻击下的测试stats
 
         self.log_train_stats_t = -100000
         self.attacker_pop_size = args.attacker_pop_size
@@ -205,8 +207,10 @@ class Robust_ParallelRunner:
                     pre_transition_data["state"].append(data["state"])
                     pre_transition_data["avail_actions"].append(data["avail_actions"])
                     pre_transition_data["obs"].append(data["obs"])
-                    pre_transition_data["left_attack"].append([(1 - attack_cnts[idx] / attack_num,)])
-
+                    if attack_num:
+                        pre_transition_data["left_attack"].append([(1 - attack_cnts[idx] / attack_num,)])
+                    else:
+                        pre_transition_data["left_attack"].append([0])
             # Add post_transiton data into the batch
             self.batch.update(post_transition_data, bs=envs_not_terminated, ts=self.t, mark_filled=False)
 
@@ -228,9 +232,11 @@ class Robust_ParallelRunner:
             env_stat = parent_conn.recv()
             env_stats.append(env_stat)
 
+        # 使用标准的统计容器（原始逻辑）
         cur_stats = self.test_stats if test_mode else self.train_stats
         cur_returns = self.test_returns if test_mode else self.train_returns
         log_prefix = "test_" if test_mode else ""
+        
         infos = [cur_stats] + final_env_infos
 
         cur_stats.update({k: sum(d.get(k, 0) for d in infos) for k in set.union(*[set(d) for d in infos])})
@@ -250,6 +256,145 @@ class Robust_ParallelRunner:
 
         return self.batch
 
+    
+    def run_under_attack(self, mac, test_mode=False):
+        """
+        运行episode进行训练或测试（攻击版本 - 用于测试对抗鲁棒性）
+        
+        与 run() 逻辑完全相同，但使用独立的统计容器：
+        - test_under_attack_stats
+        - test_under_attack_returns
+        - log_prefix = "test_under_attack_"
+        
+        用于对抗训练的双测试模式。
+        """
+        self.mac = mac
+        self.reset()
+
+        all_terminated = False
+        episode_returns = [0 for _ in range(self.batch_size)]
+        episode_lengths = [0 for _ in range(self.batch_size)]
+        self.mac.init_hidden(batch_size=self.batch_size)
+        terminated = [False for _ in range(self.batch_size)]
+        envs_not_terminated = [b_idx for b_idx, termed in enumerate(terminated) if not termed]
+        final_env_infos = []
+        attack_cnts = [0 for _ in range(self.batch_size)]
+        
+        if test_mode==True:
+            attack_num = self.args.num_attack_test
+        else:
+            attack_num = self.args.num_attack_train
+        
+        while True:
+            ori_actions, byzantine_actions, victim_id = self.mac.select_byzantine_actions(self.batch, t_ep=self.t, t_env=self.t_env, bs=envs_not_terminated, test_mode=test_mode)
+            
+            actions_chosen = {
+                "actions": ori_actions.unsqueeze(1).to("cpu"),
+                "byzantine_actions": byzantine_actions.unsqueeze(1).to("cpu"),
+                "victim_id": victim_id.to("cpu")
+            }
+
+            self.batch.update(actions_chosen, bs=envs_not_terminated, ts=self.t, mark_filled=False)
+
+            do_actions = copy.deepcopy(ori_actions)
+            
+            actual_batch_idx = 0
+            for idx in envs_not_terminated:
+                if attack_cnts[idx] < attack_num:
+                    attack_agent_id = victim_id[actual_batch_idx].data
+                    if attack_agent_id != self.args.n_agents:
+                        attack_cnts[idx] += 1
+                        do_actions[actual_batch_idx][attack_agent_id] = copy.deepcopy(byzantine_actions[actual_batch_idx][attack_agent_id])
+                        actual_batch_idx += 1
+            do_actions = do_actions.to("cpu").numpy()
+            
+            action_idx = 0
+            for idx, parent_conn in enumerate(self.parent_conns):
+                if idx in envs_not_terminated:
+                    if not terminated[idx]:
+                        parent_conn.send(("step", do_actions[action_idx]))
+                    action_idx += 1
+
+            envs_not_terminated = [b_idx for b_idx, termed in enumerate(terminated) if not termed]
+            all_terminated = all(terminated)
+            if all_terminated:
+                break
+
+            post_transition_data = {
+                "reward": [],
+                "terminated": []
+            }
+            pre_transition_data = {
+                "state": [],
+                "avail_actions": [],
+                "obs": [],
+                "left_attack": []
+            }
+
+            for idx, parent_conn in enumerate(self.parent_conns):
+                if not terminated[idx]:
+                    data = parent_conn.recv()
+                    post_transition_data["reward"].append((data["reward"],))
+
+                    episode_returns[idx] += data["reward"]
+                    episode_lengths[idx] += 1
+                    if not test_mode:
+                        self.env_steps_this_run += 1
+
+                    env_terminated = False
+                    if data["terminated"]:
+                        final_env_infos.append(data["info"])
+                    if data["terminated"] and not data["info"].get("episode_limit", False):
+                        env_terminated = True
+                    terminated[idx] = data["terminated"]
+                    post_transition_data["terminated"].append((env_terminated,))
+
+                    pre_transition_data["state"].append(data["state"])
+                    pre_transition_data["avail_actions"].append(data["avail_actions"])
+                    pre_transition_data["obs"].append(data["obs"])
+                    if attack_num:
+                        pre_transition_data["left_attack"].append([(1 - attack_cnts[idx] / attack_num,)])
+                    else:
+                        pre_transition_data["left_attack"].append([0])
+            
+            self.batch.update(post_transition_data, bs=envs_not_terminated, ts=self.t, mark_filled=False)
+            self.t += 1
+            self.batch.update(pre_transition_data, bs=envs_not_terminated, ts=self.t, mark_filled=True)
+
+        if not test_mode:
+            self.t_env += self.env_steps_this_run
+
+        for parent_conn in self.parent_conns:
+            parent_conn.send(("get_stats",None))
+
+        env_stats = []
+        for parent_conn in self.parent_conns:
+            env_stat = parent_conn.recv()
+            env_stats.append(env_stat)
+
+        # 使用攻击测试的统计容器
+        cur_stats = self.test_under_attack_stats if test_mode else self.train_stats
+        cur_returns = self.test_under_attack_returns if test_mode else self.train_returns
+        log_prefix = "test_under_attack_" if test_mode else ""
+        
+        infos = [cur_stats] + final_env_infos
+
+        cur_stats.update({k: sum(d.get(k, 0) for d in infos) for k in set.union(*[set(d) for d in infos])})
+        cur_stats["n_episodes"] = self.batch_size + cur_stats.get("n_episodes", 0)
+        cur_stats["ep_length"] = sum(episode_lengths) + cur_stats.get("ep_length", 0)
+
+        cur_returns.extend(episode_returns)
+
+        n_test_runs = max(1, self.args.test_nepisode // self.batch_size) * self.batch_size
+        if test_mode and (len(self.test_under_attack_returns) == n_test_runs):
+            self._log(cur_returns, cur_stats, log_prefix)
+        elif self.t_env - self.log_train_stats_t >= self.args.runner_log_interval:
+            self._log(cur_returns, cur_stats, log_prefix)
+            if hasattr(self.mac.action_selector, "epsilon"):
+                self.logger.log_stat("epsilon", self.mac.action_selector.epsilon, self.t_env)
+            self.log_train_stats_t = self.t_env
+
+        return self.batch
     
     
     def _log(self, returns, stats, prefix):
