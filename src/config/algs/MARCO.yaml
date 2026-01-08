@@ -96,14 +96,14 @@ smoothing_factor: 0.02                 # Smoothing factor for attacker metrics
 
 one_buffer: True                       # Use single replay buffer for all attackers
 concat_left_time: True                 # Concatenate remaining budget to attacker state
-attack_lr: 0.0002                      # Base learning rate for attackers
+attack_lr: 0.002                      # Base learning rate for attackers
 attacker_hidden_dim: 64                # Hidden dimension for attacker network
 attacker_soft_tau: 0.005               # Soft update parameter for attacker target network
 attack_agent_selector: "sparse"        # Action selector for attackers
 
 adversarial_training: True             # Enable adversarial training
-num_attack_train: 12                   # Number of training attacks per episode
-num_attack_test: 10                    # Number of test attacks per episode
+num_attack_train: 30                   # Number of training attacks per episode
+num_attack_test: 30                   # Number of test attacks per episode
 sparse_ref_delta: 0.05                 # Delta for sparse reference distribution
 load_sparse_ref_delta: 0.05            # Delta for loading sparse reference
 

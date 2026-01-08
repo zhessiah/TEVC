@@ -472,6 +472,22 @@ def run_sequential(args, logger):
                 elite_index, replace_index = evolver.epoch(population, fitness, agent_level=True, alpha_t=alpha_t)
                 best_agents = elite_index
                 
+                # Log defender fitness statistics (all defenders)
+                if args.use_tensorboard:
+                    for i in range(args.pop_size):
+                        # Objective 1: TD Error (optimality) - 注意 fitness 存的是负值
+                        logger.log_stat(f"defender_{i}_td_error", -fitness[i][0], runner.t_env)
+                        # Objective 2: Robustness (fault isolation)
+                        logger.log_stat(f"defender_{i}_robustness", -fitness[i][1], runner.t_env)
+                    
+                    # Also log population statistics
+                    td_errors = [-f[0] for f in fitness]
+                    robustness_scores = [-f[1] for f in fitness]
+                    logger.log_stat("defender_td_error_mean", np.mean(td_errors), runner.t_env)
+                    logger.log_stat("defender_td_error_std", np.std(td_errors), runner.t_env)
+                    logger.log_stat("defender_robustness_mean", np.mean(robustness_scores), runner.t_env)
+                    logger.log_stat("defender_robustness_std", np.std(robustness_scores), runner.t_env)
+                
                 # Update elite archive with current elites
                 # if use_adversarial_novelty and len(elite_index) > 0:
                 #     learner.update_elite_archive(elite_index, episode_batch)
@@ -581,14 +597,21 @@ def run_sequential(args, logger):
                         f"Elites: {attacker_elite_index[:5]}"
                     )
                     
-                    # Log attacker fitness statistics
+                    # Log attacker fitness statistics (all attackers)
                     if args.use_tensorboard:
-                        for i in range(min(3, args.attacker_pop_size)):
-                            if i < len(attacker_fitness):
-                                # Objective 1: TD Error (cognitive disruption metric)
-                                logger.log_stat(f"attacker_{i}_td_error", attacker_fitness[i][0], runner.t_env)
-                                # Objective 2: Behavioral Novelty (diversity metric)
-                                logger.log_stat(f"attacker_{i}_novelty", attacker_fitness[i][1], runner.t_env) 
+                        for i in range(args.attacker_pop_size):
+                            # Objective 1: TD Error (cognitive disruption metric)
+                            logger.log_stat(f"attacker_{i}_td_error", attacker_fitness[i][0], runner.t_env)
+                            # Objective 2: Behavioral Novelty (diversity metric)
+                            logger.log_stat(f"attacker_{i}_novelty", attacker_fitness[i][1], runner.t_env)
+                        
+                        # Also log population statistics
+                        td_errors = [f[0] for f in attacker_fitness]
+                        novelties = [f[1] for f in attacker_fitness]
+                        logger.log_stat("attacker_td_error_mean", np.mean(td_errors), runner.t_env)
+                        logger.log_stat("attacker_td_error_std", np.std(td_errors), runner.t_env)
+                        logger.log_stat("attacker_novelty_mean", np.mean(novelties), runner.t_env)
+                        logger.log_stat("attacker_novelty_std", np.std(novelties), runner.t_env) 
         
         
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
