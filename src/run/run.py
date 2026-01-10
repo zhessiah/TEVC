@@ -327,6 +327,11 @@ def run_sequential(args, logger):
     init_steps = getattr(args, 'td_init_steps', 50)  # Steps to compute TD_init
     
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
+    
+    # Log global attack parameters (MARCO-specific) to TensorBoard
+    if args.use_tensorboard and hasattr(args, 'num_attack_train') and hasattr(args, 'num_attack_test'):
+        logger.log_stat("config/num_attack_train", args.num_attack_train, runner.t_env)
+        logger.log_stat("config/num_attack_test", args.num_attack_test, runner.t_env)
 
     while runner.t_env <= args.t_max:
         
