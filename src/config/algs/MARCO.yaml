@@ -66,11 +66,8 @@ td_init_steps: 50                      # Steps to compute baseline TD_init
 # ============================================================================
 # Attacker Evolution Settings
 # ============================================================================
-attacker_pop_size: 20                  # Attacker population size
+attacker_pop_size: 30                  # Attacker population size
 
-# --- Attacker Fitness (2 Objectives) ---
-# Objective 1 (Quality): Negative defender reward - maximize damage
-# Objective 2 (Novelty): Behavioral diversity - explore attack space
 
 # --- Attack Budget & Advantage Function ---
 # New mechanism (V6): Budget-Modulated Attack Advantage
@@ -83,7 +80,7 @@ budget_lambda: 1.0                     # Budget modulation strength λ
 # --- Attacker Memetic SGD (Policy Gradient with Attack Advantage) ---
 # REFACTORED: Uses attack advantage + policy gradient loss
 # L_att = -E[Σ A_att(j)·log π(j)]
-attacker_finetune_lr: 0.00002          # Learning rate for memetic SGD (attack_lr * 0.1)
+attacker_finetune_lr: 0.002          # Learning rate for memetic SGD (attack_lr * 0.1)
                                        # Conservative to avoid breaking evolved structure
 
 # --- Attacker Parameters ---
@@ -102,8 +99,8 @@ attacker_soft_tau: 0.005               # Soft update parameter for attacker targ
 attack_agent_selector: "sparse"        # Action selector for attackers
 
 adversarial_training: True             # Enable adversarial training
-num_attack_train: 30                   # Number of training attacks per episode
-num_attack_test: 30                   # Number of test attacks per episode
+num_attack_train: 15                   # Number of training attacks per episode
+num_attack_test: 15                    # Number of test attacks per episode
 sparse_ref_delta: 0.05                 # Delta for sparse reference distribution
 load_sparse_ref_delta: 0.05            # Delta for loading sparse reference
 

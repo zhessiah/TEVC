@@ -36,8 +36,8 @@ bash install_gfootball.sh
 
 ```shell
 # For SMAC
-conda activate ROMANCE
-CUDA_VISIBLE_DEVICES=1 python3 src/main.py --config=MARCO --env-config=sc2 with env_args.map_name=MMM
+conda activate pymarl
+CUDA_VISIBLE_DEVICES=0 python3 src/main.py --config=MARCO --env-config=sc2 with env_args.map_name=MMM
 ```
 
 ```shell

@@ -3,8 +3,6 @@ import torch as th
 from torch.optim import RMSprop
 import torch.nn.functional as F
 import torch.nn as nn
-from tqdm import tqdm
-import os
 from components.action_selectors import REGISTRY as action_REGISTRY
 from components.episode_buffer import ReplayBuffer
 import copy
