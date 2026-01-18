@@ -99,8 +99,8 @@ attacker_soft_tau: 0.005               # Soft update parameter for attacker targ
 attack_agent_selector: "sparse"        # Action selector for attackers
 
 adversarial_training: True             # Enable adversarial training
-num_attack_train: 15                   # Number of training attacks per episode
-num_attack_test: 15                    # Number of test attacks per episode
+num_attack_train: 60                   # Number of training attacks per episode
+num_attack_test: 60                   # Number of test attacks per episode
 sparse_ref_delta: 0.05                 # Delta for sparse reference distribution
 load_sparse_ref_delta: 0.05            # Delta for loading sparse reference
 

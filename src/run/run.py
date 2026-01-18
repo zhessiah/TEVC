@@ -573,6 +573,14 @@ def run_sequential(args, logger):
                     # - Different attackers produce different counterfactual actions → different TD errors
                     attacker_fitness = [[] for _ in range(args.attacker_pop_size)]
                     
+                    # === Step 2.1: Calculate novelty for ALL attackers at once (O(N) optimization) ===
+                    # REFACTORED: Avoid redundant computation (was O(N²), now O(N))
+                    with th.no_grad():
+                        all_novelties = learner.calculate_all_attacker_novelties(
+                            episode_batch, population_attackers
+                        )
+                    
+                    # === Step 2.2: Calculate fitness for each attacker ===
                     for i in range(args.attacker_pop_size):
                         # Objective 1: TD Error Maximization (CORRECTED V6)
                         # Uses counterfactual action construction (no env rollout!)
@@ -584,12 +592,9 @@ def run_sequential(args, logger):
                         # Higher TD error = better attacker (more cognitive disruption)
                         attacker_fitness[i].append(td_error.item())
                         
-                        # Objective 2: Behavioral Novelty (unchanged from V6)
+                        # Objective 2: Behavioral Novelty (pre-computed above)
                         # Diversity to avoid local optima
-                        novelty = learner.calculate_attacker_behavioral_novelty(
-                            episode_batch, i, best_attackers, population_attackers
-                        )
-                        attacker_fitness[i].append(novelty.item() if th.is_tensor(novelty) else novelty)
+                        attacker_fitness[i].append(all_novelties[i])
                     
                     # === Step 3: Evolutionary selection for attackers ===
                     attacker_elite_index, attacker_replace_index = attacker_evolver.epoch(

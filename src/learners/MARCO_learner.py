@@ -6,6 +6,7 @@ from modules.mixers.qatten import QattenMixer
 from envs.matrix_game import print_matrix_status
 from utils.rl_utils import build_td_lambda_targets, build_q_lambda_targets
 import torch as th
+import torch.nn.functional as F
 from torch.optim import RMSprop, Adam
 import numpy as np
 from utils.th_utils import get_parameters_num
@@ -923,64 +924,136 @@ class MARCOLearner:
     # 2. Novelty: Attack pattern diversity (calculate_attacker_behavioral_novelty)
     # =================================================================
 
-    # ========== Attacker Novelty Calculation ==========
+    # ========== Attacker Novelty Calculation (REFACTORED: Batch KL-Divergence) ==========
+    def calculate_all_attacker_novelties(self, batch, population_attackers):
+        """
+        OPTIMIZED: Calculate novelty for ALL attackers in ONE pass (eliminates N² redundancy).
+        
+        Previous approach: Called calculate_attacker_behavioral_novelty() N times
+        - Each call recomputed all N distributions → O(N²) complexity
+        - Wasteful: Same distributions computed N times
+        
+        NEW APPROACH (inspired by population.py d_loss):
+        - Compute action probability distribution π_i(a|s,k) for each attacker ONCE
+        - Uses ALL timesteps in the episode (complete attack pattern evaluation)
+        - Calculate population consensus: π_mean(a|s,k) = (1/N) Σ π_i(a|s,k)
+        - Novelty_i = KL(π_i || π_mean) for all i simultaneously
+        
+        Key Innovation:
+        - O(N) complexity instead of O(N²)
+        - Evaluates complete attack behavior over entire episode
+        - Higher KL divergence → more different from population → higher novelty
+        - Direct policy-space diversity (vs. behavior-space distance)
+        
+        Args:
+            batch: Episode batch data
+            population_attackers: List of all attacker instances
+            
+        Returns:
+            novelty_scores: List of novelty scores (one per attacker), length = pop_size
+        """
+        pop_size = len(population_attackers)
+        
+        # Edge case: single attacker has no diversity reference
+        if pop_size == 1:
+            return [0.0]
+        
+        # Step 1: Get action distributions for all attackers over ALL timesteps in episode
+        # This captures the complete attack pattern for the entire episode
+        all_action_dists = []
+        for attacker in population_attackers:
+            attacker.eval()
+            # Get distribution for each timestep in the episode
+            action_dist = self._get_attacker_action_distribution_batch(attacker, batch)
+            all_action_dists.append(action_dist)
+        
+        # Step 2: Calculate population consensus (mean distribution)
+        all_action_dists = th.stack(all_action_dists, dim=0)  # (pop_size, bs*seq_len, n_agents+1)
+        mean_action_dist = all_action_dists.mean(dim=0)  # (bs*seq_len, n_agents+1)
+        
+        # Step 3: Calculate KL divergence for ALL attackers simultaneously
+        novelty_scores = []
+        for i in range(pop_size):
+            current_dist = all_action_dists[i]  # (bs*seq_len, n_agents+1)
+            
+            # KL(current || mean) = Σ p(x) log(p(x)/q(x))
+            # Using F.kl_div: expects log(q) as input, p as target
+            kl_divergence = F.kl_div(
+                th.log(mean_action_dist),  # log of mean (reference)
+                current_dist,  # current distribution (target)
+                reduction='batchmean'
+            )
+            
+            novelty_scores.append(kl_divergence.item())
+        
+        return novelty_scores
+    
     def calculate_attacker_behavioral_novelty(self, batch, attacker_idx, elite_attackers, population_attackers):
         """
-        Calculate behavioral novelty of an attacker compared to elite archive.
+        DEPRECATED: Use calculate_all_attacker_novelties() instead for O(N) efficiency.
         
-        Behavioral Characterization:
-        - Victim selection pattern: distribution of which agents are targeted
-        - Attack timing: when attacks occur in the episode
-        - Attack efficiency: coverage vs budget usage
+        This function is kept for backward compatibility only.
+        It internally calls the optimized batch version.
         
         Args:
             batch: Episode batch data
             attacker_idx: Index of current attacker in population
-            elite_attackers: Indices of elite attackers (archive)
+            elite_attackers: Indices of elite attackers (archive) [UNUSED]
             population_attackers: List of all attacker instances
             
         Returns:
-            novelty_score: Average behavioral distance to elite archive
+            novelty_score: KL divergence from population consensus
         """
-        if len(elite_attackers) == 0:
-            # No archive yet, maximum novelty
-            return th.tensor(1.0, device=self.device)
+        # Call the optimized batch version and extract the specific attacker's novelty
+        all_novelties = self.calculate_all_attacker_novelties(batch, population_attackers)
+        return th.tensor(all_novelties[attacker_idx], device=self.device)
+    
+    def _get_attacker_action_distribution_batch(self, attacker, batch):
+        """
+        Get action probability distribution for an attacker over ALL timesteps in episode batch.
         
-        current_attacker = population_attackers[attacker_idx]
-        current_attacker.eval()
+        Uses attacker.batch_forward() to compute distributions for entire episode.
+        This captures the complete attack pattern: π(a|s,k) for all (s,k) in episode.
         
-        # Extract behavioral features for current attacker
-        current_behavior = self._extract_attacker_behavior(batch, current_attacker)
+        Policy: π(a|s,k) = softmax(logits(s,k))
+        - Attacker network directly outputs logits over victim choices (n_agents+1 actions)
+        - Apply softmax to convert to probability distribution
         
-        # Compute behavioral distance to each elite
-        distances = []
-        for elite_idx in elite_attackers:
-            if elite_idx == attacker_idx:
-                continue  # Skip self-comparison
+        Args:
+            attacker: Attacker network
+            batch: Episode batch data
             
-            elite_attacker = population_attackers[elite_idx]
-            elite_attacker.eval()
+        Returns:
+            action_probs: (bs*seq_len, n_agents+1) probability distribution over all timesteps
+        """
+        with th.no_grad():
+            bs = batch.batch_size
+            seq_len = batch.max_seq_length
             
-            elite_behavior = self._extract_attacker_behavior(batch, elite_attacker)
+            # Collect Q-values for all timesteps
+            all_q_values = []
+            for t in range(seq_len):
+                attacker_logits = attacker.batch_forward(batch, t)  # (bs, n_agents+1)
+                all_q_values.append(attacker_logits)
             
-            # Compute behavioral distance (L2 norm in behavior space)
-            distance = self._behavioral_distance(current_behavior, elite_behavior)
-            distances.append(distance)
-        
-        if len(distances) == 0:
-            return th.tensor(1.0, device=self.device)
-        
-        # Novelty = average distance to k-nearest neighbors (k=min(3, len(archive)))
-        k = min(3, len(distances))
-        distances_tensor = th.tensor(distances, device=self.device)
-        topk_distances = th.topk(distances_tensor, k, largest=False).values
-        novelty_score = th.mean(topk_distances)
-        
-        return novelty_score
+            all_q_values = th.stack(all_q_values, dim=1)  # (bs, seq_len, n_agents+1)
+            
+            # Reshape to (bs*seq_len, n_agents+1) for batch processing
+            logits_flat = all_q_values.reshape(-1, self.args.n_agents + 1)
+            
+            # Directly apply softmax to attacker's logits
+            # The attacker network outputs logits, not Q-values
+            # π(a|s,k) = softmax(logits(s,k))
+            action_probs = F.softmax(logits_flat, dim=-1)  # (bs*seq_len, n_agents+1)
+            
+            return action_probs
+    
+    # ========== OLD BEHAVIOR-BASED NOVELTY FUNCTIONS (DEPRECATED) ==========
+    # Kept for reference, but no longer used in new KL-divergence approach
     
     def _extract_attacker_behavior(self, batch, attacker):
         """
-        Extract behavioral characterization of an attacker.
+        [DEPRECATED] Extract behavioral characterization of an attacker.
         
         Returns:
             behavior_vector: Dictionary containing:
