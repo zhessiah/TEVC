@@ -11,7 +11,7 @@ from .offpg_learner import OffPGLearner
 from .fmac_learner import FMACLearner
 from .maddpg_learner import MADDPGLearner
 from .m3ddpg_learner import M3DDPGLearner
-from .MARCO_learner import MARCOLearner
+from .MACO_learner import MACOLearner
 
 REGISTRY = {}
 
@@ -28,4 +28,4 @@ REGISTRY["offpg_learner"] = OffPGLearner
 REGISTRY["fmac_learner"] = FMACLearner
 REGISTRY["maddpg_learner"] = MADDPGLearner
 REGISTRY["m3ddpg_learner"] = M3DDPGLearner
-REGISTRY["MARCO_learner"] = MARCOLearner
+REGISTRY["MACO_learner"] = MACOLearner

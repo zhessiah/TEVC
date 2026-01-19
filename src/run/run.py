@@ -328,7 +328,7 @@ def run_sequential(args, logger):
     
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
     
-    # Log global attack parameters (MARCO-specific) to TensorBoard
+    # Log global attack parameters (MACO-specific) to TensorBoard
     if args.use_tensorboard and hasattr(args, 'num_attack_train') and hasattr(args, 'num_attack_test'):
         logger.log_stat("config/num_attack_train", args.num_attack_train, runner.t_env)
         logger.log_stat("config/num_attack_test", args.num_attack_test, runner.t_env)
@@ -451,11 +451,11 @@ def run_sequential(args, logger):
             if args.EA and runner.t_env > args.start_timesteps and episode % args.EA_freq == 0:
                 # print('EA starts')
                 
-                # === Step 1: DEPRECATED - Lamarckian SGD Injection ===
+                # === Step 1: DEPRECATED - Memetic SGD Injection ===
                 # MACO_overview.md V6 refactoring: Explicit memetic learning is REMOVED
                 # Main agent learning IS the implicit memetic mechanism
                 # Only memetic injection (rl_to_evo_excluding_elites) is used
-                use_lamarckian_sgd = False  # Force disable (deprecated)
+                use_memetic_sgd = False  # Force disable (deprecated)
                      
                 # === Step 2: Fitness Evaluation (Simplified to 2 Objectives) ===
                 # MACO V6: Defenders have only 2 objectives
@@ -502,7 +502,7 @@ def run_sequential(args, logger):
                     f"Elites: {elite_index[:5]}, Replace: {replace_index}"
                 )
                 
-                # === Step 4: Closing the Lamarckian Loop (参数回注阶段) ===
+                # === Step 4: Closing the Memetic Loop (参数回注阶段) ===
                 
                 # 4a. RL → Evolution: 用 RL 智能体替换最差个体（注入快速学习能力）
                 # NOTE: This step is now handled AFTER EACH TRAINING in the training loop above
@@ -520,11 +520,11 @@ def run_sequential(args, logger):
                     
                     # === Step 1: Memetic SGD for Elite Attackers (NEW: Budget-Modulated Advantage) ===
                     # Uses new attack advantage function from MACO V6
-                    use_attacker_lamarckian = getattr(args, 'use_attacker_memetic_sgd', True)
+                    use_attacker_memetic = getattr(args, 'use_attacker_memetic_sgd', True)
                     num_finetune_attackers = getattr(args, 'num_finetune_attackers', 3)
                     attacker_sgd_steps = getattr(args, 'attacker_memetic_sgd_steps', 1)
                     
-                    if use_attacker_lamarckian:
+                    if use_attacker_memetic:
                         logger.console_logger.info(
                             f"[Attacker Memetic SGD] Finetuning Top-{num_finetune_attackers} "
                             f"elite attackers with {attacker_sgd_steps} SGD steps (Attack Advantage)..."
@@ -532,7 +532,7 @@ def run_sequential(args, logger):
                         
                         for attacker_idx in best_attackers[:num_finetune_attackers]:
                             # 微调该attacker使用Attack Advantage (budget-modulated)
-                            quality_loss = learner.lamarckian_finetune_attacker(
+                            quality_loss = learner.memetic_finetune_attacker(
                                 population_attackers[attacker_idx], 
                                 episode_batch, 
                                 attacker_sgd_steps
