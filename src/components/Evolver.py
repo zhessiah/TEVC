@@ -192,39 +192,65 @@ class NN_Evolver:
         return weight
 
     def crossover_inplace(self, gene1, gene2):
-        # Evaluate the parents
-
-        b_1 = None
-        b_2 = None
-        for param1, param2 in zip(gene1.parameters(), gene2.parameters()):
-            # References to the variable tensors
+        """
+        FIXED: Correctly pair each weight matrix with its corresponding bias vector.
+        
+        Original Bug:
+        - Used the LAST bias for ALL weight matrices
+        - Caused IndexError when weight.shape[0] > last_bias.shape[0]
+        
+        Fix:
+        - Look ahead to find the corresponding bias for each weight
+        - Verify bias dimensions match: bias.shape[0] == weight.shape[0]
+        - Only swap bias if it exists and dimensions match
+        """
+        # Convert parameters to list to enable lookahead
+        params1 = list(gene1.parameters())
+        params2 = list(gene2.parameters())
+        
+        i = 0
+        while i < len(params1):
+            param1 = params1[i]
+            param2 = params2[i]
+            
             W1 = param1.data
             W2 = param2.data
-            if len(W1.shape) == 1:
-                b_1 = W1
-                b_2 = W2
-
-        for param1, param2 in zip(gene1.parameters(), gene2.parameters()):
-            # References to the variable tensors
-            W1 = param1.data
-            W2 = param2.data
-
-            if len(W1.shape) == 2:  # Weights no bias
+            
+            # Only process weight matrices (2D tensors)
+            if len(W1.shape) == 2:
+                # Look ahead to find corresponding bias
+                b_1 = None
+                b_2 = None
+                if i + 1 < len(params1):
+                    next_param1 = params1[i + 1]
+                    next_param2 = params2[i + 1]
+                    
+                    # Verify it's the corresponding bias: 1D and matching output dimension
+                    if (len(next_param1.data.shape) == 1 and 
+                        next_param1.data.shape[0] == W1.shape[0]):
+                        b_1 = next_param1.data
+                        b_2 = next_param2.data
+                
+                # Perform crossover on weight matrix
                 num_variables = W1.shape[0]
-                # Crossover opertation [Indexed by row]
-                num_cross_overs = fastrand.pcg32bounded(num_variables * 2)  # Lower bounded on full swaps
-                for i in range(num_cross_overs):
-                    receiver_choice = random.random()  # Choose which gene to receive the perturbation
+                num_cross_overs = fastrand.pcg32bounded(num_variables * 2)
+                
+                for _ in range(num_cross_overs):
+                    receiver_choice = random.random()
+                    ind_cr = fastrand.pcg32bounded(W1.shape[0])
+                    
                     if receiver_choice < 0.5:
-                        ind_cr = fastrand.pcg32bounded(W1.shape[0])  #
                         W1[ind_cr, :] = W2[ind_cr, :]
-                        b_1[ind_cr] = b_2[ind_cr]
+                        # Only swap bias if it exists and dimensions match
+                        if b_1 is not None:
+                            b_1[ind_cr] = b_2[ind_cr]
                     else:
-                        ind_cr = fastrand.pcg32bounded(W1.shape[0])  #
                         W2[ind_cr, :] = W1[ind_cr, :]
-                        b_2[ind_cr] = b_1[ind_cr]
-
-        # Evaluate the children
+                        # Only swap bias if it exists and dimensions match
+                        if b_2 is not None:
+                            b_2[ind_cr] = b_1[ind_cr]
+            
+            i += 1
 
     def mutate_inplace(self, gene, agent_level=False):
         trials = 5

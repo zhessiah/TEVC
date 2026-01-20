@@ -518,7 +518,43 @@ def run_sequential(args, logger):
                 if args.adversarial_training:
                     logger.console_logger.info("[Attacker Evolution] Starting attacker population evolution...")
                     
-                    # === Step 1: Memetic SGD for Elite Attackers (NEW: Budget-Modulated Advantage) ===
+                    # === Step 1: Quality-Diversity Selection (K-Means + TD Error) ===
+                    # CRITICAL: QD selection MUST be preserved for behavior diversity!
+                    # QD Framework (MACO V6):
+                    # 1. Quality Metric: TD Error (single objective - attacker effectiveness)
+                    # 2. Diversity Metric: Conditional Victim Distribution V_φ (behavior descriptor)
+                    # 3. Selection Method: K-Means clustering in behavior space
+                    # 4. Elite Selection: Best attacker from each cluster (K diverse strategies)
+                    #
+                    # Why QD is essential:
+                    # - Prevents convergence to single victim target
+                    # - Maintains n_agents different attack strategies
+                    # - Ensures comprehensive defender training coverage
+                    
+                    logger.console_logger.info(
+                        f"[Attacker QD Selection] Computing fitness and behavior vectors..."
+                    )
+                    
+                    # Get number of clusters from args (default: n_agents for victim-centric diversity)
+                    num_clusters = getattr(args, 'attacker_num_clusters', args.n_agents)
+                    
+                    # Call QD selection: K-Means clustering + elite selection
+                    with th.no_grad():
+                        attacker_elite_index, attacker_replace_index, fitness_dict = \
+                            learner.quality_diversity_selection(
+                                episode_batch, 
+                                population_attackers,
+                                num_clusters=num_clusters
+                            )
+                    
+                    best_attackers = attacker_elite_index
+                    
+                    logger.console_logger.info(
+                        f"[Attacker QD Selection] Selected {len(attacker_elite_index)} elites from "
+                        f"{num_clusters} clusters. Elites: {attacker_elite_index[:5]}"
+                    )
+                    
+                    # === Step 2: Memetic SGD for Elite Attackers (NEW: Budget-Modulated Advantage) ===
                     # Uses new attack advantage function from MACO V6
                     use_attacker_memetic = getattr(args, 'use_attacker_memetic_sgd', True)
                     num_finetune_attackers = getattr(args, 'num_finetune_attackers', 3)
@@ -546,82 +582,76 @@ def run_sequential(args, logger):
                             f"Elite {best_attackers[0]} Advantage Loss: {quality_loss:.6f}"
                         )
                     
-                    # === Step 2: Calculate attacker fitness (Simplified to 2 Objectives) ===
-                    # CORRECTED V6: TD Error Maximization with Counterfactual Actions
-                    # 
-                    # Mathematical Foundation:
-                    # F_att,1(φ) = E_τ [(y - Q_tot(s, a_φ))²]
-                    # 
-                    # Where a_φ = counterfactual actions under attacker φ's Byzantine interference
-                    # 
-                    # Byzantine Attack Model:
-                    # - Attacker φ selects victims via φ.batch_forward(batch, t)
-                    # - Victim's actions are replaced with Byzantine (worst) actions
-                    # - Different attackers → different victim selections → different actions → different TD errors
-                    # 
-                    # Key Efficiency:
-                    # 1. NO environment rollout needed (offline batch computation)
-                    # 2. Reuses batch's pre-computed byzantine_actions
-                    # 3. Only recomputes victim selection (cheap forward pass)
-                    # 4. Dense signal: per-timestep TD error (vs per-episode reward)
-                    #
-                    # Why this works:
-                    # - calculate_attacker_TD_error() constructs counterfactual actions
-                    # - Uses attacker i to select victims for each timestep
-                    # - Replaces victim actions with byzantine_actions from batch
-                    # - Computes Q(s, a_counterfactual) and TD error
-                    # - Different attackers produce different counterfactual actions → different TD errors
-                    attacker_fitness = [[] for _ in range(args.attacker_pop_size)]
+                    logger.console_logger.info(
+                        f"[Attacker QD Selection] Selected {len(attacker_elite_index)} elites from "
+                        f"{num_clusters} clusters. Elites: {attacker_elite_index[:5]}"
+                    )
                     
-                    # === Step 2.1: Calculate novelty for ALL attackers at once (O(N) optimization) ===
-                    # REFACTORED: Avoid redundant computation (was O(N²), now O(N))
-                    with th.no_grad():
-                        all_novelties = learner.calculate_all_attacker_novelties(
-                            episode_batch, population_attackers
+                    # === Step 3: Genetic Operations (Preserve QD Selection) ===
+                    # Manually perform crossover & mutation to preserve QD-selected elites
+                    # This is CRITICAL: we must NOT call attacker_evolver.epoch() because it would
+                    # overwrite QD's clustering-based selection with fitness-based selection!
+                    
+                    if len(attacker_replace_index) > 0:
+                        logger.console_logger.info(
+                            f"[Attacker Genetic Ops] Performing crossover & mutation on "
+                            f"{len(attacker_replace_index)} non-elite attackers (preserving QD selection)..."
+                        )
+                        
+                        # Execute genetic operations for each non-elite attacker
+                        for replace_idx in attacker_replace_index:
+                            # Tournament selection: pick 2 random elites as parents
+                            parent1_idx = np.random.choice(attacker_elite_index)
+                            parent2_idx = np.random.choice(attacker_elite_index)
+                            
+                            offspring = population_attackers[replace_idx]
+                            parent1 = population_attackers[parent1_idx]
+                            parent2 = population_attackers[parent2_idx]
+                            
+                            # Copy parent1's parameters to offspring (optimized)
+                            offspring.load_state_dict(parent1.state_dict())
+                            
+                            # Crossover: blend offspring (copy of parent1) with parent2
+                            attacker_evolver.crossover_inplace(offspring, parent2)
+                            
+                            # Mutation: add Gaussian noise to parameters
+                            attacker_evolver.mutate_inplace(offspring, agent_level=True)
+                        
+                        logger.console_logger.info(
+                            f"[Attacker Genetic Ops] Completed evolution for {len(attacker_replace_index)} attackers. "
+                            f"QD diversity preserved!"
+                        )
+                    else:
+                        # FIXED (Bug 10): Log when all attackers are elites
+                        logger.console_logger.info(
+                            "[Attacker Genetic Ops] All attackers are elites, no replacement needed."
                         )
                     
-                    # === Step 2.2: Calculate fitness for each attacker ===
-                    for i in range(args.attacker_pop_size):
-                        # Objective 1: TD Error Maximization (CORRECTED V6)
-                        # Uses counterfactual action construction (no env rollout!)
-                        with th.no_grad():
-                            td_error = learner.calculate_attacker_TD_error(
-                                episode_batch, i, population_attackers
-                            )
-                        
-                        # Higher TD error = better attacker (more cognitive disruption)
-                        attacker_fitness[i].append(td_error.item())
-                        
-                        # Objective 2: Behavioral Novelty (pre-computed above)
-                        # Diversity to avoid local optima
-                        attacker_fitness[i].append(all_novelties[i])
-                    
-                    # === Step 3: Evolutionary selection for attackers ===
-                    attacker_elite_index, attacker_replace_index = attacker_evolver.epoch(
-                        population_attackers, attacker_fitness, agent_level=True, alpha_t=alpha_t
-                    )
-                    best_attackers = attacker_elite_index
-                    
-                    logger.console_logger.info(
-                        f"[Attacker Evolution] New attacker generation. "
-                        f"Elites: {attacker_elite_index[:5]}"
-                    )
-                    
-                    # Log attacker fitness statistics (all attackers)
+                    # Log attacker fitness and behavior statistics
                     if args.use_tensorboard:
-                        for i in range(args.attacker_pop_size):
-                            # Objective 1: TD Error (cognitive disruption metric)
-                            logger.log_stat(f"attacker_{i}_td_error", attacker_fitness[i][0], runner.t_env)
-                            # Objective 2: Behavioral Novelty (diversity metric)
-                            logger.log_stat(f"attacker_{i}_novelty", attacker_fitness[i][1], runner.t_env)
+                        td_errors = fitness_dict['td_errors']
+                        behavior_vectors = fitness_dict['behavior_vectors']
+                        cluster_labels = fitness_dict['cluster_labels']
                         
-                        # Also log population statistics
-                        td_errors = [f[0] for f in attacker_fitness]
-                        novelties = [f[1] for f in attacker_fitness]
+                        # Log individual attacker TD errors
+                        for i in range(args.attacker_pop_size):
+                            logger.log_stat(f"attacker_{i}_td_error", td_errors[i], runner.t_env)
+                            logger.log_stat(f"attacker_{i}_cluster", int(cluster_labels[i]), runner.t_env)
+                        
+                        # Log population statistics
                         logger.log_stat("attacker_td_error_mean", np.mean(td_errors), runner.t_env)
                         logger.log_stat("attacker_td_error_std", np.std(td_errors), runner.t_env)
-                        logger.log_stat("attacker_novelty_mean", np.mean(novelties), runner.t_env)
-                        logger.log_stat("attacker_novelty_std", np.std(novelties), runner.t_env) 
+                        logger.log_stat("attacker_td_error_max", np.max(td_errors), runner.t_env)
+                        logger.log_stat("attacker_td_error_min", np.min(td_errors), runner.t_env)
+                        
+                        # Log behavior diversity (average pairwise distance in behavior space)
+                        from scipy.spatial.distance import pdist
+                        behavior_diversity = np.mean(pdist(behavior_vectors, metric='euclidean'))
+                        logger.log_stat("attacker_behavior_diversity", behavior_diversity, runner.t_env)
+                        
+                        # Log elite performance
+                        elite_td_errors = td_errors[attacker_elite_index]
+                        logger.log_stat("attacker_elite_td_error_mean", np.mean(elite_td_errors), runner.t_env) 
         
         
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)

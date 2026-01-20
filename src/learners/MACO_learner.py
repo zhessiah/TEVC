@@ -1008,9 +1008,58 @@ class MACOLearner:
 #         all_novelties = self.calculate_all_attacker_novelties(batch, population_attackers)
 #         return th.tensor(all_novelties[attacker_idx], device=self.device)
 #     
+    def _get_attacker_conditional_victim_distribution(self, attacker, batch):
+        """
+        NEW (MACO QD): Extract Conditional Victim Distribution as Behavior Descriptor.
+        
+        Behavior Vector V_φ = [p_1, p_2, ..., p_N]:
+        - p_i = Expected probability of attacking agent i (excluding No-Op)
+        - Uses softmax probabilities to capture stochastic attack preferences
+        
+        Key Insight:
+        - Uses expected probabilities (not greedy sampling) for stable behavior descriptors
+        - Ignores "No-Op" action (index N) by marginalizing over victim actions
+        - Forms a probability simplex over N agents (not N+1)
+        
+        Returns:
+            victim_dist: (N,) numpy array - Conditional probability over victims
+        """
+        with th.no_grad():
+            bs = batch.batch_size
+            seq_len = batch.max_seq_length
+            n_agents = self.args.n_agents
+            
+            # FIXED (Bug 4): Use expected probabilities instead of greedy sampling
+            # Method: Compute softmax probabilities and average over time
+            all_probs_agents = []
+            for t in range(seq_len):
+                attacker_logits = attacker.batch_forward(batch, t)  # (bs, n_agents+1)
+                attack_probs = th.softmax(attacker_logits, dim=-1)  # (bs, n_agents+1)
+                attack_probs_agents_only = attack_probs[:, :n_agents]  # (bs, n_agents) - exclude No-Op
+                all_probs_agents.append(attack_probs_agents_only)
+            
+            all_probs_agents = th.stack(all_probs_agents, dim=1)  # (bs, seq_len, n_agents)
+            
+            # Expected victim distribution: average probability across batch and time
+            victim_dist = all_probs_agents.mean(dim=(0, 1))  # (n_agents,)
+            
+            # Renormalize (in case of numerical errors)
+            victim_dist_sum = victim_dist.sum()
+            if victim_dist_sum > 1e-8:
+                victim_dist = victim_dist / victim_dist_sum
+            else:
+                # Edge case: all probabilities near zero → uniform distribution
+                victim_dist = th.ones(n_agents, device=self.device) / n_agents
+            
+            return victim_dist.cpu().numpy()  # (N,)
+    
     def _get_attacker_action_distribution_batch(self, attacker, batch):
         """
-        Get action probability distribution for an attacker over ALL timesteps in episode batch.
+        DEPRECATED (kept for backward compatibility).
+        
+        OLD MECHANISM: Get action probability distribution for an attacker over ALL timesteps.
+        This function is replaced by _get_attacker_conditional_victim_distribution()
+        in the new QD framework.
         
         Uses attacker.batch_forward() to compute distributions for entire episode.
         This captures the complete attack pattern: π(a|s,k) for all (s,k) in episode.
@@ -1139,18 +1188,19 @@ class MACOLearner:
 #     # ========== Attacker Memetic SGD Training (NEW APPROACH) ==========
     def memetic_finetune_attacker(self, attacker, episode_batch, num_sgd_steps=1):
         """
-        REFACTORED: Memetic SGD for Attacker using Budget-Modulated Attack Advantage.
-        Replaces old Soft Q-Learning with policy gradient-like approach.
+        REFACTORED V2: Memetic SGD for Attacker using Counterfactual Attack Advantage.
         
-        New Training Mechanism (MACO):
-        1. Attack Advantage Function: A_att(j|s,k) = Q_j(s,u_j) - γ(k)·Q̄(s)
-        2. Budget Modulation: γ(k) = 1 + budget_lambda(K-k)/K (higher threshold when budget is scarce)
-        3. Policy Gradient Loss: L_att = -E[Σ A_att(j)·log π(j)]
+        New Training Mechanism (MACO QD):
+        1. Attack Utility: U_att(j|s) = Q_tot(s, u) - Q_tot(s, <u_worst_j, u_-j>)
+           - Measures the counterfactual drop in global Q when agent j is attacked
+        2. Budget Modulation: γ(k) = 1 + λ(K-k)/K (higher threshold when budget is scarce)
+        3. Attack Advantage: A_att(j|s,k) = U_att(j|s) - γ(k)·Ū(s)
+        4. Policy Gradient Loss: L_att = -E[Σ A_att(j)·log π(j)]
         
         Key Innovation:
-        - Teaches attacker "opportunity cost awareness" (好钢用在刀刃上)
-        - When budget is low, only attack high-value targets
-        - When budget is high, attack above-average targets
+        - Counterfactual reasoning: directly measures global value disruption
+        - Budget-aware opportunity cost: forces strategic target selection
+        - No environment interaction: purely offline based on defender's Q_tot
         
         Args:
             attacker: MLPAttacker instance to finetune
@@ -1193,8 +1243,6 @@ class MACOLearner:
         # 3. Multi-step SGD finetuning
         for step in range(num_sgd_steps):
             # === Step 1: Get defender's local Q-values for all agents ===
-            # We need Q_j(s, u_j) for each agent j to compute attack advantage
-            # Use the main RL genome to get Q-values
             self.Genome.eval()
             self.Genome.init_hidden(batch.batch_size)
             
@@ -1210,21 +1258,76 @@ class MACOLearner:
             actions = batch["actions"][:, :-1]  # (bs, seq_len-1, n_agents, 1)
             chosen_q = th.gather(agent_q, dim=3, index=actions).squeeze(3)  # (bs, seq_len-1, n_agents)
             
-            # === Step 2: Compute Attack Advantage ===
-            # Average Q across all agents: Q̄(s) = (1/N) Σ Q_j(s, u_j)
-            Q_bar = chosen_q.mean(dim=2, keepdim=True)  # (bs, seq_len-1, 1)
+            # === Step 2: Compute Counterfactual Attack Utility (OPTIMIZED: Batch Computation) ===
+            # For each agent j, compute: U_att(j) = Q_tot(u) - Q_tot(<u_worst_j, u_-j>)
             
-            # Budget modulation factor: γ(k) = 1 + budget_lambda(K-k)/K
+            # 2.1: Get Q_tot for normal actions
+            with th.no_grad():
+                Q_tot_normal = self.mixer(chosen_q, batch["state"][:, :-1])  # (bs, seq_len-1, 1)
+            
+            # 2.2: Batch compute Q_tot for ALL counterfactual scenarios at once
+            n_agents = self.args.n_agents
+            bs, seq_len, _ = chosen_q.shape
+            
+            # FIXED (Bug 2): Add dimension validation
+            assert batch["state"].shape[1] == batch.max_seq_length, \
+                f"State dim mismatch: {batch['state'].shape[1]} vs {batch.max_seq_length}"
+            assert batch["state"][:, :-1].shape[1] == seq_len, \
+                f"State sequence mismatch: {batch['state'][:, :-1].shape[1]} vs {seq_len}"
+            
+            # Find worst action for each agent: argmin Q_j(o_j, a)
+            worst_actions = agent_q.argmin(dim=3)  # (bs, seq_len-1, n_agents)
+            
+            # Get worst Q values for all agents
+            worst_q_values = th.gather(agent_q, dim=3, index=worst_actions.unsqueeze(-1)).squeeze(-1)  # (bs, seq_len-1, n_agents)
+            
+            # OPTIMIZED: Create diagonal mask to replace each agent's Q with worst Q one at a time
+            # Shape: (n_agents, bs, seq_len-1, n_agents)
+            # For scenario j: all agents use chosen_q except agent j uses worst_q_values
+            counterfactual_q_all = chosen_q.unsqueeze(0).expand(n_agents, -1, -1, -1).clone()  # (n_agents, bs, seq_len-1, n_agents)
+            
+            # Create index tensor for advanced indexing
+            agent_indices = th.arange(n_agents, device=self.device)
+            counterfactual_q_all[agent_indices, :, :, agent_indices] = worst_q_values.permute(2, 0, 1)  # Replace diagonal
+            
+            # Reshape for batch mixer computation: (n_agents * bs, seq_len-1, n_agents)
+            counterfactual_q_batch = counterfactual_q_all.reshape(n_agents * bs, seq_len, n_agents)
+            state_batch = batch["state"][:, :-1].unsqueeze(0).expand(n_agents, -1, -1, -1).reshape(n_agents * bs, seq_len, -1)
+            
+            # Single mixer call for all counterfactual scenarios!
+            with th.no_grad():
+                Q_tot_counterfactual_batch = self.mixer(counterfactual_q_batch, state_batch)  # (n_agents * bs, seq_len-1, 1)
+            
+            # Reshape back: (n_agents, bs, seq_len-1, 1)
+            Q_tot_counterfactual = Q_tot_counterfactual_batch.reshape(n_agents, bs, seq_len, 1)
+            
+            # Compute attack utilities: (n_agents, bs, seq_len-1) -> transpose to (bs, seq_len-1, n_agents)
+            attack_utilities = (Q_tot_normal.unsqueeze(0) - Q_tot_counterfactual).squeeze(-1).permute(1, 2, 0)
+            
+            # Ensure non-negative (due to monotonicity, should be ≥ 0)
+            attack_utilities = th.clamp(attack_utilities, min=0.0)  # (bs, seq_len-1, n_agents)
+            
+            # FIXED (Bug 3): Check for NaN in attack_utilities
+            if not th.isfinite(attack_utilities).all():
+                print("[WARNING] NaN detected in attack_utilities")
+                return float('inf')
+            
+            # === Step 3: Compute Budget-Aware Attack Advantage ===
+            # Baseline utility: average attack utility across all agents
+            U_bar = attack_utilities.mean(dim=2, keepdim=True)  # (bs, seq_len-1, 1)
+            
+            # Budget modulation factor: γ(k) = 1 + λ·(K-k)/K
+            # As remaining budget k decreases → (K-k) increases → γ increases (higher threshold)
             gamma_k = 1.0 + budget_lambda * (K - left_attack) / K  # (bs, seq_len-1, 1)
             
-            # Attack Advantage for each agent j: A_att(j) = Q_j - γ(k)·Q̄
-            attack_advantage = chosen_q - gamma_k * Q_bar  # (bs, seq_len-1, n_agents)
+            # Attack Advantage: A_att(j) = U_att(j) - γ(k)·Ū
+            attack_advantage = attack_utilities - gamma_k * U_bar  # (bs, seq_len-1, n_agents)
             
-            # For "no-attack" option (j=N+1), advantage is 0
+            # For "no-attack" option (j=N+1), advantage is 0 (baseline anchor)
             no_attack_advantage = th.zeros_like(attack_advantage[:, :, :1])  # (bs, seq_len-1, 1)
             attack_advantage_full = th.cat([attack_advantage, no_attack_advantage], dim=2)  # (bs, seq_len-1, n_agents+1)
             
-            # === Step 3: Get attacker's action probabilities ===
+            # === Step 4: Get attacker's action probabilities ===
             attacker_logits = []
             for t in range(batch.max_seq_length):
                 logit = attacker.batch_forward(batch, t=t)
@@ -1234,10 +1337,15 @@ class MACOLearner:
             # Convert to log probabilities
             log_probs = th.log_softmax(attacker_logits, dim=-1)  # (bs, seq_len-1, n_agents+1)
             
-            # === Step 4: Policy Gradient Loss ===
+            # FIXED (Bug 3): Check for NaN in log_probs
+            if not th.isfinite(log_probs).all():
+                print("[WARNING] NaN detected in log_probs")
+                return float('inf')
+            
+            # === Step 5: Policy Gradient Loss ===
             # L_att = -E[Σ_j A_att(j) · log π(j)]
             # If A_att(j) > 0: High advantage → increase log π(j)  
-            # If A_att(j) < 0: Low advantage → decrease log π(j)
+            # If A_att(j) < 0 (all below baseline): advantage of No-Op (0) becomes highest
             policy_loss = -(attack_advantage_full * log_probs * mask).sum() / mask.sum()
             
             # Check if loss is valid
@@ -1252,4 +1360,153 @@ class MACOLearner:
         
         # 4. Return final loss for monitoring
         return policy_loss.item()
+    
+    
+    # ============================================================================
+    # NEW: Quality-Diversity (QD) Framework for Attacker Evolution
+    # ============================================================================
+    
+    def quality_diversity_selection(self, batch, population_attackers, num_clusters=None):
+        """
+        NEW (MACO QD): Quality-Diversity Selection using K-Means Clustering.
+        
+        Replaces NSGA-II dual-objective selection with explicit behavior space partitioning.
+        
+        Algorithm:
+        1. Compute fitness (TD Error) for each attacker
+        2. Extract behavior vectors V_φ (Conditional Victim Distribution)
+        3. Cluster behavior space into K clusters via K-Means
+        4. Select best attacker (max TD Error) from each cluster
+        
+        Key Innovation:
+        - Explicit behavior diversity via clustering (not implicit Pareto front)
+        - Fitness is ONLY TD Error (single objective)
+        - Diversity is enforced by K-Means partitioning
+        - Ensures exploration of different attack strategies
+        
+        Args:
+            batch: Episode batch for fitness evaluation
+            population_attackers: List of attacker instances
+            num_clusters: Number of clusters (default: pop_size // 2)
+            
+        Returns:
+            elite_indices: Indices of selected attackers (one per cluster)
+            replace_indices: Indices of attackers to be replaced
+            fitness_dict: Dictionary with fitness and behavior info
+        """
+        from sklearn.cluster import KMeans
+        
+        pop_size = len(population_attackers)
+        n_agents = self.args.n_agents
+        
+        # Default: half of population becomes elites
+        if num_clusters is None:
+            num_clusters = max(1, pop_size // 2)
+        
+        # === Step 1: Compute TD Error (Quality) for all attackers ===
+        td_errors = []
+        for i in range(pop_size):
+            with th.no_grad():
+                td_error = self.calculate_attacker_TD_error(
+                    batch, i, population_attackers
+                )
+            td_errors.append(td_error.item())
+        
+        td_errors = np.array(td_errors)
+        
+        # === Step 2: Extract Behavior Vectors (Diversity) - with progress tracking ===
+        behavior_vectors = []
+        for i, attacker in enumerate(population_attackers):
+            victim_dist = self._get_attacker_conditional_victim_distribution(attacker, batch)
+            behavior_vectors.append(victim_dist)
+        
+        behavior_vectors = np.array(behavior_vectors)  # (pop_size, N)
+        
+        # === Step 3: K-Means Clustering in Behavior Space (OPTIMIZED) ===
+        # FIXED (Bug 8): Check if behavior vectors are too similar (early training)
+        behavior_variance = np.var(behavior_vectors, axis=0).sum()
+        
+        if behavior_variance < 1e-6:
+            # All attackers have nearly identical behavior → random selection
+            print(f"[QD Selection WARNING] Behavior vectors too similar (var={behavior_variance:.2e}), using random selection")
+            elite_indices = np.random.choice(pop_size, size=min(num_clusters, pop_size), replace=False).tolist()
+            replace_indices = [i for i in range(pop_size) if i not in elite_indices]
+            
+            # Create dummy cluster labels
+            cluster_labels = np.zeros(pop_size, dtype=int)
+            for i, elite_idx in enumerate(elite_indices):
+                cluster_labels[elite_idx] = i
+            
+            fitness_dict = {
+                'td_errors': td_errors,
+                'behavior_vectors': behavior_vectors,
+                'cluster_labels': cluster_labels,
+                'elite_indices': elite_indices,
+                'replace_indices': replace_indices,
+                'warning': 'behavior_vectors_too_similar'
+            }
+            
+            return elite_indices, replace_indices, fitness_dict
+        
+        # Handle edge cases
+        if num_clusters >= pop_size:
+            # Each attacker is its own cluster
+            cluster_labels = np.arange(pop_size)
+        else:
+            # Optimized K-Means parameters:
+            # - n_init='auto' (faster, sklearn 1.4+) or 3 (legacy compatibility)
+            # - max_iter=100 (reduced from default 300)
+            # - tol=1e-3 (relaxed from default 1e-4)
+            try:
+                kmeans = KMeans(
+                    n_clusters=num_clusters, 
+                    random_state=42, 
+                    n_init='auto',  # sklearn 1.4+: adaptive initialization
+                    max_iter=100,    # Reduced iterations
+                    tol=1e-3         # Relaxed tolerance
+                )
+            except TypeError:
+                # Fallback for older sklearn versions
+                kmeans = KMeans(
+                    n_clusters=num_clusters, 
+                    random_state=42, 
+                    n_init=3,        # Reduced from default 10
+                    max_iter=100, 
+                    tol=1e-3
+                )
+            cluster_labels = kmeans.fit_predict(behavior_vectors)
+        
+        # === Step 4: Select Best Attacker from Each Cluster ===
+        elite_indices = []
+        for cluster_id in range(num_clusters):
+            # Get all attackers in this cluster
+            cluster_mask = (cluster_labels == cluster_id)
+            cluster_attackers = np.where(cluster_mask)[0]
+            
+            # FIXED (Bug 6): Handle empty clusters by selecting from existing elites
+            if len(cluster_attackers) == 0:
+                if len(elite_indices) > 0:
+                    # Fill with random existing elite to maintain num_clusters elites
+                    elite_indices.append(np.random.choice(elite_indices))
+                continue
+            
+            # Select attacker with highest TD Error in this cluster
+            cluster_td_errors = td_errors[cluster_attackers]
+            best_in_cluster = cluster_attackers[np.argmax(cluster_td_errors)]
+            elite_indices.append(int(best_in_cluster))
+        
+        # === Step 5: Determine Replace Indices ===
+        elite_set = set(elite_indices)
+        replace_indices = [i for i in range(pop_size) if i not in elite_set]
+        
+        # === Step 6: Return Results ===
+        fitness_dict = {
+            'td_errors': td_errors,
+            'behavior_vectors': behavior_vectors,
+            'cluster_labels': cluster_labels,
+            'elite_indices': elite_indices,
+            'replace_indices': replace_indices
+        }
+        
+        return elite_indices, replace_indices, fitness_dict
     
