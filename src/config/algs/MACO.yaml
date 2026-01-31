@@ -1,4 +1,4 @@
-# --- MARCO specific parameters ---
+# --- MACO specific parameters ---
 
 # use epsilon greedy action selector
 action_selector: "epsilon_greedy"
@@ -22,7 +22,7 @@ mac: "attack_mac"
 agent: "n_rnn"
 agent_output_type: q
 
-learner: "MARCO_learner"
+learner: "MACO_learner"
 mixer: "qmix"
 mixing_embed_dim: 32
 hypernet_embed: 64
@@ -104,4 +104,4 @@ num_attack_test: 25                    # Number of test attacks per episode
 sparse_ref_delta: 0.05                 # Delta for sparse reference distribution
 load_sparse_ref_delta: 0.05            # Delta for loading sparse reference
 
-name: "MARCO_env=8_adam_td_lambda"
+name: "MACO_env=8_adam_td_lambda"

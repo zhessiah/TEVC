@@ -6,6 +6,7 @@ from modules.mixers.qatten import QattenMixer
 from envs.matrix_game import print_matrix_status
 from utils.rl_utils import build_td_lambda_targets, build_q_lambda_targets
 import torch as th
+import torch.nn.functional as F
 from torch.optim import RMSprop, Adam
 import numpy as np
 from utils.th_utils import get_parameters_num
@@ -15,7 +16,7 @@ from utils.attack_util import logits_margin, attack, get_diff, noise_atk, get_ma
 from controllers import REGISTRY as mac_REGISTRY
 
 
-class MARCOLearner:
+class MACOLearner:
     def __init__(self, genome, pop_genome, scheme, logger, args):
         self.args = args
         self.Genome = genome  # Single Genome (双MAC) for RL training
@@ -205,7 +206,7 @@ class MARCOLearner:
 
 
     # ========== SIMPLIFIED DEFENDER FITNESS FUNCTIONS (2 objectives only) ==========
-    # Following MACO_overview.md V6 refactoring:
+    # Following MACO refactoring:
     # Defender Fitness (2 objectives):
     # 1. Optimality: TD Error (calculate_TD_error) - environment fitting accuracy
     # 2. Robustness: Fault Isolation Ratio (calculate_adversarial_loss) - Byzantine fault tolerance
@@ -337,7 +338,7 @@ class MARCOLearner:
         return -mean_isolation_ratio
     
     # ========== REMOVED DEPRECATED FITNESS FUNCTIONS ==========
-    # Following MACO_overview.md V6 refactoring - complexity reduction
+    # Following MACO refactoring - complexity reduction
     # Removed functions:
     # - calculate_influence_constraint (权力制衡约束)
     # - calculate_evolutionary_consensus (种群共识校准)  
@@ -497,182 +498,182 @@ class MARCOLearner:
         
         return info
     
-    def lamarckian_finetune(self, pop_genome, batch, num_sgd_steps=1):
-        """
-        DEPRECATED: This function is kept for backward compatibility only.
-        According to MACO_overview.md V6 refactoring, explicit memetic learning is REMOVED.
-        
-        Rationale from document:
-        "我们可以novel一些，不再说'memetic learning' 而是'memetic injection模因注入/文化注入'。
-        然后去掉原本的memetic learning的过程。"
-        
-        The main agent learning (train()) itself IS the implicit memetic mechanism:
-        - Main agent learns via SGD (TD error minimization)
-        - Parameters are injected to replace dominated individuals (memetic injection)
-        - This is equivalent to Value-Evolutionary-Based Reinforcement Learning
-        
-        DO NOT CALL THIS FUNCTION IN NEW CODE.
-        Use only: rl_to_evo_excluding_elites() for parameter injection.
-        
-        Original description:
-        Lamarckian SGD Injection: 对种群中的单个 Genome 进行 SGD 微调。
-        
-        **Lamarckian 特性**: 微调直接修改个体的权重（基因），因此获得的改进会遗传给后代。
-        与达尔文进化不同，这里"后天学习"的结果会改变遗传信息。
-        
-        Args:
-            pop_genome: 要微调的 Genome（来自 self.pop_genome）
-            batch: EpisodeBatch 用于 SGD 训练
-            num_sgd_steps: SGD 迭代次数（默认 1）
-            
-        Returns:
-            td_loss: 微调后的 TD 损失（用于监控）
-        """
-        # 1. 为该个体创建临时优化器（避免影响主 RL 优化器）
-        genome_params = list(pop_genome.parameters())
-        
-        # 使用更保守的学习率进行微调（防止破坏进化得到的结构和梯度爆炸）
-        finetune_lr = getattr(self.args, 'finetune_lr', self.args.lr * 0.01)  # 改为 0.01 (更保守)
-        
-        if self.args.optimizer == 'adam':
-            genome_optimizer = Adam(params=genome_params, lr=finetune_lr)
-        else:
-            genome_optimizer = RMSprop(params=genome_params, lr=finetune_lr, 
-                                      alpha=self.args.optim_alpha, eps=self.args.optim_eps)
-        
-        # 初始化 loss（防止循环内跳过导致未定义）
-        L_td = th.tensor(0.0, device=self.device)
-        
-        # 2. 执行 SGD 步骤
-        for _ in range(num_sgd_steps):
-            # Get the relevant quantities
-            rewards = batch["reward"][:, :-1]
-            actions = batch["actions"][:, :-1]
-            terminated = batch["terminated"][:, :-1].float()
-            mask = batch["filled"][:, :-1].float()
-            mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-            avail_actions = batch["avail_actions"]
-            
-            # Set to train mode
-            pop_genome.train()
-            
-            # Forward pass for mac1
-            mac_out_1 = []
-            pop_genome.mac1.init_hidden(batch.batch_size)
-            for t in range(batch.max_seq_length):
-                agent_outs_1 = pop_genome.mac1.forward(batch, t=t)
-                mac_out_1.append(agent_outs_1)
-            
-            # Forward pass for mac2
-            mac_out_2 = []
-            pop_genome.mac2.init_hidden(batch.batch_size)
-            for t in range(batch.max_seq_length):
-                agent_outs_2 = pop_genome.mac2.forward(batch, t=t)
-                mac_out_2.append(agent_outs_2)
-            
-            mac_out_1 = th.stack(mac_out_1, dim=1)
-            mac_out_2 = th.stack(mac_out_2, dim=1)
-            
-            # Pick Q-values for actions taken
-            chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions).squeeze(3)
-            chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions).squeeze(3)
-            
-            # Calculate targets using pop_genome itself (detached to avoid gradients)
-            # 关键修复：不使用 self.target_Genome，而是用 pop_genome 自己的 detached 版本
-            with th.no_grad():
-                # 使用 pop_genome 自己来计算目标（而非主 RL 的 target 网络）
-                pop_genome.eval()  # 临时设为 eval 模式计算目标
-                
-                # 计算目标 Q 值
-                target_mac_out_1 = []
-                pop_genome.mac1.init_hidden(batch.batch_size)
-                for t in range(batch.max_seq_length):
-                    target_agent_outs = pop_genome.mac1.forward(batch, t=t)
-                    target_mac_out_1.append(target_agent_outs)
-                
-                target_mac_out_2 = []
-                pop_genome.mac2.init_hidden(batch.batch_size)
-                for t in range(batch.max_seq_length):
-                    target_agent_outs = pop_genome.mac2.forward(batch, t=t)
-                    target_mac_out_2.append(target_agent_outs)
-                
-                target_mac_out_1 = th.stack(target_mac_out_1, dim=1)
-                target_mac_out_2 = th.stack(target_mac_out_2, dim=1)
-                
-                # 使用 min(Q1, Q2) 作为目标（Double Q-learning 的保守估计）
-                target_mac_out = th.min(target_mac_out_1, target_mac_out_2)
-                
-                # Double Q-learning: 使用当前网络选择动作，目标网络评估
-                mac_out_combined = th.min(mac_out_1, mac_out_2)
-                mac_out_detach = mac_out_combined.clone().detach()
-                mac_out_detach[avail_actions == 0] = -9999999
-                cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
-                target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
-                
-                # 使用 pop_genome 的 mixer（而非 self.target_mixer）
-                target_max_qvals = self.mixer(target_max_qvals, batch["state"])
-                
-                if getattr(self.args, 'q_lambda', False):
-                    qvals = th.gather(target_mac_out, 3, batch["actions"]).squeeze(3)
-                    qvals = self.mixer(qvals, batch["state"])
-                    targets = build_q_lambda_targets(rewards, terminated, mask, target_max_qvals, qvals,
-                                                    self.args.gamma, self.args.td_lambda)
-                else:
-                    targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals,
-                                                     self.args.n_agents, self.args.gamma, self.args.td_lambda)
-                
-                pop_genome.train()  # 恢复训练模式
-            
-            # Apply mixer from pop_genome
-            chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
-            chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
-            
-            # Calculate TD error
-            td_error_1 = (chosen_action_qvals_1 - targets.detach())
-            td_error2_1 = 0.5 * td_error_1.pow(2)
-            
-            td_error_2 = (chosen_action_qvals_2 - targets.detach())
-            td_error2_2 = 0.5 * td_error_2.pow(2)
-            
-            mask_expanded = mask.expand_as(td_error2_1)
-            masked_td_error_1 = td_error2_1 * mask_expanded
-            masked_td_error_2 = td_error2_2 * mask_expanded
-            
-            # Total loss
-            L_td_1 = masked_td_error_1.sum() / (mask_expanded.sum() + 1e-8)
-            L_td_2 = masked_td_error_2.sum() / (mask_expanded.sum() + 1e-8)
-            L_td = L_td_1 + L_td_2
-            
-            # 检查 loss 是否有效（防止 NaN/Inf 传播）
-            if not th.isfinite(L_td):
-                # Loss 无效，跳过此次更新
-                return float('inf')
-            
-            # 限制 loss 的最大值（防止梯度爆炸）
-            max_loss = getattr(self.args, 'max_finetune_loss', 100.0)
-            if L_td.item() > max_loss:
-                # Loss 过大，使用裁剪后的 loss
-                L_td = th.clamp(L_td, max=max_loss)
-            
-            # Optimize
-            genome_optimizer.zero_grad()
-            L_td.backward()
-            
-            # 更严格的梯度裁剪
-            grad_norm_clip = getattr(self.args, 'finetune_grad_clip', self.args.grad_norm_clip * 0.5)
-            grad_norm = th.nn.utils.clip_grad_norm_(genome_params, grad_norm_clip)
-            
-            # 检查梯度是否有效
-            if not th.isfinite(grad_norm):
-                # 梯度无效，跳过此次更新
-                genome_optimizer.zero_grad()
-                return float('inf')
-            
-            genome_optimizer.step()
-        
-        # 3. 返回最终损失（用于监控微调效果）
-        return L_td.item()
-
+#     def memetic_finetune(self, pop_genome, batch, num_sgd_steps=1):
+#         """
+#         DEPRECATED: This function is kept for backward compatibility only.
+#         According to MACO refactoring, explicit memetic learning is REMOVED.
+#         
+#         Rationale from document:
+#         "我们可以novel一些，不再说'memetic learning' 而是'memetic injection模因注入/文化注入'。
+#         然后去掉原本的memetic learning的过程。"
+#         
+#         The main agent learning (train()) itself IS the implicit memetic mechanism:
+#         - Main agent learns via SGD (TD error minimization)
+#         - Parameters are injected to replace dominated individuals (memetic injection)
+#         - This is equivalent to Value-Evolutionary-Based Reinforcement Learning
+#         
+#         DO NOT CALL THIS FUNCTION IN NEW CODE.
+#         Use only: rl_to_evo_excluding_elites() for parameter injection.
+#         
+#         Original description:
+#         Memetic SGD Injection: 对种群中的单个 Genome 进行 SGD 微调。
+#         
+#         **Memetic 特性**: 微调直接修改个体的权重（基因），因此获得的改进会遗传给后代。
+#         与达尔文进化不同，这里"后天学习"的结果会改变遗传信息。
+#         
+#         Args:
+#             pop_genome: 要微调的 Genome（来自 self.pop_genome）
+#             batch: EpisodeBatch 用于 SGD 训练
+#             num_sgd_steps: SGD 迭代次数（默认 1）
+#             
+#         Returns:
+#             td_loss: 微调后的 TD 损失（用于监控）
+#         """
+#         # 1. 为该个体创建临时优化器（避免影响主 RL 优化器）
+#         genome_params = list(pop_genome.parameters())
+#         
+#         # 使用更保守的学习率进行微调（防止破坏进化得到的结构和梯度爆炸）
+#         finetune_lr = getattr(self.args, 'finetune_lr', self.args.lr * 0.01)  # 改为 0.01 (更保守)
+#         
+#         if self.args.optimizer == 'adam':
+#             genome_optimizer = Adam(params=genome_params, lr=finetune_lr)
+#         else:
+#             genome_optimizer = RMSprop(params=genome_params, lr=finetune_lr, 
+#                                       alpha=self.args.optim_alpha, eps=self.args.optim_eps)
+#         
+#         # 初始化 loss（防止循环内跳过导致未定义）
+#         L_td = th.tensor(0.0, device=self.device)
+#         
+#         # 2. 执行 SGD 步骤
+#         for _ in range(num_sgd_steps):
+#             # Get the relevant quantities
+#             rewards = batch["reward"][:, :-1]
+#             actions = batch["actions"][:, :-1]
+#             terminated = batch["terminated"][:, :-1].float()
+#             mask = batch["filled"][:, :-1].float()
+#             mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+#             avail_actions = batch["avail_actions"]
+#             
+#             # Set to train mode
+#             pop_genome.train()
+#             
+#             # Forward pass for mac1
+#             mac_out_1 = []
+#             pop_genome.mac1.init_hidden(batch.batch_size)
+#             for t in range(batch.max_seq_length):
+#                 agent_outs_1 = pop_genome.mac1.forward(batch, t=t)
+#                 mac_out_1.append(agent_outs_1)
+#             
+#             # Forward pass for mac2
+#             mac_out_2 = []
+#             pop_genome.mac2.init_hidden(batch.batch_size)
+#             for t in range(batch.max_seq_length):
+#                 agent_outs_2 = pop_genome.mac2.forward(batch, t=t)
+#                 mac_out_2.append(agent_outs_2)
+#             
+#             mac_out_1 = th.stack(mac_out_1, dim=1)
+#             mac_out_2 = th.stack(mac_out_2, dim=1)
+#             
+#             # Pick Q-values for actions taken
+#             chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions).squeeze(3)
+#             chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions).squeeze(3)
+#             
+#             # Calculate targets using pop_genome itself (detached to avoid gradients)
+#             # 关键修复：不使用 self.target_Genome，而是用 pop_genome 自己的 detached 版本
+#             with th.no_grad():
+#                 # 使用 pop_genome 自己来计算目标（而非主 RL 的 target 网络）
+#                 pop_genome.eval()  # 临时设为 eval 模式计算目标
+#                 
+#                 # 计算目标 Q 值
+#                 target_mac_out_1 = []
+#                 pop_genome.mac1.init_hidden(batch.batch_size)
+#                 for t in range(batch.max_seq_length):
+#                     target_agent_outs = pop_genome.mac1.forward(batch, t=t)
+#                     target_mac_out_1.append(target_agent_outs)
+#                 
+#                 target_mac_out_2 = []
+#                 pop_genome.mac2.init_hidden(batch.batch_size)
+#                 for t in range(batch.max_seq_length):
+#                     target_agent_outs = pop_genome.mac2.forward(batch, t=t)
+#                     target_mac_out_2.append(target_agent_outs)
+#                 
+#                 target_mac_out_1 = th.stack(target_mac_out_1, dim=1)
+#                 target_mac_out_2 = th.stack(target_mac_out_2, dim=1)
+#                 
+#                 # 使用 min(Q1, Q2) 作为目标（Double Q-learning 的保守估计）
+#                 target_mac_out = th.min(target_mac_out_1, target_mac_out_2)
+#                 
+#                 # Double Q-learning: 使用当前网络选择动作，目标网络评估
+#                 mac_out_combined = th.min(mac_out_1, mac_out_2)
+#                 mac_out_detach = mac_out_combined.clone().detach()
+#                 mac_out_detach[avail_actions == 0] = -9999999
+#                 cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
+#                 target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
+#                 
+#                 # 使用 pop_genome 的 mixer（而非 self.target_mixer）
+#                 target_max_qvals = self.mixer(target_max_qvals, batch["state"])
+#                 
+#                 if getattr(self.args, 'q_lambda', False):
+#                     qvals = th.gather(target_mac_out, 3, batch["actions"]).squeeze(3)
+#                     qvals = self.mixer(qvals, batch["state"])
+#                     targets = build_q_lambda_targets(rewards, terminated, mask, target_max_qvals, qvals,
+#                                                     self.args.gamma, self.args.td_lambda)
+#                 else:
+#                     targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals,
+#                                                      self.args.n_agents, self.args.gamma, self.args.td_lambda)
+#                 
+#                 pop_genome.train()  # 恢复训练模式
+#             
+#             # Apply mixer from pop_genome
+#             chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
+#             chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
+#             
+#             # Calculate TD error
+#             td_error_1 = (chosen_action_qvals_1 - targets.detach())
+#             td_error2_1 = 0.5 * td_error_1.pow(2)
+#             
+#             td_error_2 = (chosen_action_qvals_2 - targets.detach())
+#             td_error2_2 = 0.5 * td_error_2.pow(2)
+#             
+#             mask_expanded = mask.expand_as(td_error2_1)
+#             masked_td_error_1 = td_error2_1 * mask_expanded
+#             masked_td_error_2 = td_error2_2 * mask_expanded
+#             
+#             # Total loss
+#             L_td_1 = masked_td_error_1.sum() / (mask_expanded.sum() + 1e-8)
+#             L_td_2 = masked_td_error_2.sum() / (mask_expanded.sum() + 1e-8)
+#             L_td = L_td_1 + L_td_2
+#             
+#             # 检查 loss 是否有效（防止 NaN/Inf 传播）
+#             if not th.isfinite(L_td):
+#                 # Loss 无效，跳过此次更新
+#                 return float('inf')
+#             
+#             # 限制 loss 的最大值（防止梯度爆炸）
+#             max_loss = getattr(self.args, 'max_finetune_loss', 100.0)
+#             if L_td.item() > max_loss:
+#                 # Loss 过大，使用裁剪后的 loss
+#                 L_td = th.clamp(L_td, max=max_loss)
+#             
+#             # Optimize
+#             genome_optimizer.zero_grad()
+#             L_td.backward()
+#             
+#             # 更严格的梯度裁剪
+#             grad_norm_clip = getattr(self.args, 'finetune_grad_clip', self.args.grad_norm_clip * 0.5)
+#             grad_norm = th.nn.utils.clip_grad_norm_(genome_params, grad_norm_clip)
+#             
+#             # 检查梯度是否有效
+#             if not th.isfinite(grad_norm):
+#                 # 梯度无效，跳过此次更新
+#                 genome_optimizer.zero_grad()
+#                 return float('inf')
+#             
+#             genome_optimizer.step()
+#         
+#         # 3. 返回最终损失（用于监控微调效果）
+#         return L_td.item()
+# 
     def _update_targets(self):
         self.target_Genome.load_state(self.Genome)
         if self.mixer is not None:
@@ -704,46 +705,46 @@ class MARCOLearner:
         self.optimiser.load_state_dict(th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage))
 
     # ========== Attacker Fitness Calculation ==========
-    def calculate_attacker_quality(self, batch, attacker_idx, population_attackers):
-        """
-        DEPRECATED: This function is no longer used in run.py (V6 refactoring).
-        
-        The correct approach is to run environment with EACH attacker separately in run.py:
-        ```python
-        genome.mac1.set_attacker(population_attackers[i])
-        attacker_eval_batch = runner.run(genome, test_mode=False)
-        quality = -attacker_eval_batch["reward"].mean()
-        ```
-        
-        Kept for backward compatibility only.
-        
-        Original (incorrect) implementation:
-        Calculate attack quality: negative mean episode return (lower defender reward = better).
-        
-        Problem: This function computed quality from a shared batch, causing all attackers
-        to have identical quality values. Fixed in V6 by running separate evaluations.
-        
-        Args:
-            batch: Episode batch data (SHARED - this was the bug!)
-            attacker_idx: Index of attacker in population (unused - this was the bug!)
-            population_attackers: List of all attacker instances
-            
-        Returns:
-            mean_return: Mean episode return (scalar tensor)
-        """
-        # Extract rewards from batch
-        rewards = batch["reward"][:, :-1]  # [batch_size, T, 1]
-        mask = batch["filled"][:, :-1].float()  # [batch_size, T, 1]
-        
-        # Compute episode returns
-        episode_returns = (rewards * mask).sum(dim=1) / mask.sum(dim=1)  # [batch_size, 1]
-        mean_return = episode_returns.mean()
-        
-        return mean_return
-    
+#     def calculate_attacker_quality(self, batch, attacker_idx, population_attackers):
+#         """
+#         DEPRECATED: This function is no longer used in run.py (refactoring).
+#         
+#         The correct approach is to run environment with EACH attacker separately in run.py:
+#         ```python
+#         genome.mac1.set_attacker(population_attackers[i])
+#         attacker_eval_batch = runner.run(genome, test_mode=False)
+#         quality = -attacker_eval_batch["reward"].mean()
+#         ```
+#         
+#         Kept for backward compatibility only.
+#         
+#         Original (incorrect) implementation:
+#         Calculate attack quality: negative mean episode return (lower defender reward = better).
+#         
+#         Problem: This function computed quality from a shared batch, causing all attackers
+#         to have identical quality values. Fixed in by running separate evaluations.
+#         
+#         Args:
+#             batch: Episode batch data (SHARED - this was the bug!)
+#             attacker_idx: Index of attacker in population (unused - this was the bug!)
+#             population_attackers: List of all attacker instances
+#             
+#         Returns:
+#             mean_return: Mean episode return (scalar tensor)
+#         """
+#         # Extract rewards from batch
+#         rewards = batch["reward"][:, :-1]  # [batch_size, T, 1]
+#         mask = batch["filled"][:, :-1].float()  # [batch_size, T, 1]
+#         
+#         # Compute episode returns
+#         episode_returns = (rewards * mask).sum(dim=1) / mask.sum(dim=1)  # [batch_size, 1]
+#         mean_return = episode_returns.mean()
+#         
+#         return mean_return
+#     
     def calculate_attacker_TD_error(self, batch: EpisodeBatch, attacker_idx: int, population_attackers):
         """
-        CORRECTED V6: Calculate attacker fitness via TD Error maximization with COUNTERFACTUAL ACTIONS.
+        CORRECTED: Calculate attacker fitness via TD Error maximization with COUNTERFACTUAL ACTIONS.
         
         Mathematical Foundation:
         F_att,1(φ) = E_τ~D_φ [(y - Q_tot(s, a_φ))²]
@@ -923,161 +924,283 @@ class MARCOLearner:
     # 2. Novelty: Attack pattern diversity (calculate_attacker_behavioral_novelty)
     # =================================================================
 
-    # ========== Attacker Novelty Calculation ==========
-    def calculate_attacker_behavioral_novelty(self, batch, attacker_idx, elite_attackers, population_attackers):
+    # ========== Attacker Novelty Calculation (REFACTORED: Batch KL-Divergence) ==========
+    def calculate_all_attacker_novelties(self, batch, population_attackers):
         """
-        Calculate behavioral novelty of an attacker compared to elite archive.
+        OPTIMIZED: Calculate novelty for ALL attackers in ONE pass (eliminates N² redundancy).
         
-        Behavioral Characterization:
-        - Victim selection pattern: distribution of which agents are targeted
-        - Attack timing: when attacks occur in the episode
-        - Attack efficiency: coverage vs budget usage
+        Previous approach: Called calculate_attacker_behavioral_novelty() N times
+        - Each call recomputed all N distributions → O(N²) complexity
+        - Wasteful: Same distributions computed N times
+        
+        NEW APPROACH (inspired by population.py d_loss):
+        - Compute action probability distribution π_i(a|s,k) for each attacker ONCE
+        - Uses ALL timesteps in the episode (complete attack pattern evaluation)
+        - Calculate population consensus: π_mean(a|s,k) = (1/N) Σ π_i(a|s,k)
+        - Novelty_i = KL(π_i || π_mean) for all i simultaneously
+        
+        Key Innovation:
+        - O(N) complexity instead of O(N²)
+        - Evaluates complete attack behavior over entire episode
+        - Higher KL divergence → more different from population → higher novelty
+        - Direct policy-space diversity (vs. behavior-space distance)
         
         Args:
             batch: Episode batch data
-            attacker_idx: Index of current attacker in population
-            elite_attackers: Indices of elite attackers (archive)
             population_attackers: List of all attacker instances
             
         Returns:
-            novelty_score: Average behavioral distance to elite archive
+            novelty_scores: List of novelty scores (one per attacker), length = pop_size
         """
-        if len(elite_attackers) == 0:
-            # No archive yet, maximum novelty
-            return th.tensor(1.0, device=self.device)
+        pop_size = len(population_attackers)
         
-        current_attacker = population_attackers[attacker_idx]
-        current_attacker.eval()
+        # Edge case: single attacker has no diversity reference
+        if pop_size == 1:
+            return [0.0]
         
-        # Extract behavioral features for current attacker
-        current_behavior = self._extract_attacker_behavior(batch, current_attacker)
+        # Step 1: Get action distributions for all attackers over ALL timesteps in episode
+        # This captures the complete attack pattern for the entire episode
+        all_action_dists = []
+        for attacker in population_attackers:
+            attacker.eval()
+            # Get distribution for each timestep in the episode
+            action_dist = self._get_attacker_action_distribution_batch(attacker, batch)
+            all_action_dists.append(action_dist)
         
-        # Compute behavioral distance to each elite
-        distances = []
-        for elite_idx in elite_attackers:
-            if elite_idx == attacker_idx:
-                continue  # Skip self-comparison
+        # Step 2: Calculate population consensus (mean distribution)
+        all_action_dists = th.stack(all_action_dists, dim=0)  # (pop_size, bs*seq_len, n_agents+1)
+        mean_action_dist = all_action_dists.mean(dim=0)  # (bs*seq_len, n_agents+1)
+        
+        # Step 3: Calculate KL divergence for ALL attackers simultaneously
+        novelty_scores = []
+        for i in range(pop_size):
+            current_dist = all_action_dists[i]  # (bs*seq_len, n_agents+1)
             
-            elite_attacker = population_attackers[elite_idx]
-            elite_attacker.eval()
+            # KL(current || mean) = Σ p(x) log(p(x)/q(x))
+            # Using F.kl_div: expects log(q) as input, p as target
+            kl_divergence = F.kl_div(
+                th.log(mean_action_dist),  # log of mean (reference)
+                current_dist,  # current distribution (target)
+                reduction='batchmean'
+            )
             
-            elite_behavior = self._extract_attacker_behavior(batch, elite_attacker)
-            
-            # Compute behavioral distance (L2 norm in behavior space)
-            distance = self._behavioral_distance(current_behavior, elite_behavior)
-            distances.append(distance)
+            novelty_scores.append(kl_divergence.item())
         
-        if len(distances) == 0:
-            return th.tensor(1.0, device=self.device)
-        
-        # Novelty = average distance to k-nearest neighbors (k=min(3, len(archive)))
-        k = min(3, len(distances))
-        distances_tensor = th.tensor(distances, device=self.device)
-        topk_distances = th.topk(distances_tensor, k, largest=False).values
-        novelty_score = th.mean(topk_distances)
-        
-        return novelty_score
+        return novelty_scores
     
-    def _extract_attacker_behavior(self, batch, attacker):
+#     def calculate_attacker_behavioral_novelty(self, batch, attacker_idx, elite_attackers, population_attackers):
+#         """
+#         DEPRECATED: Use calculate_all_attacker_novelties() instead for O(N) efficiency.
+#         
+#         This function is kept for backward compatibility only.
+#         It internally calls the optimized batch version.
+#         
+#         Args:
+#             batch: Episode batch data
+#             attacker_idx: Index of current attacker in population
+#             elite_attackers: Indices of elite attackers (archive) [UNUSED]
+#             population_attackers: List of all attacker instances
+#             
+#         Returns:
+#             novelty_score: KL divergence from population consensus
+#         """
+#         # Call the optimized batch version and extract the specific attacker's novelty
+#         all_novelties = self.calculate_all_attacker_novelties(batch, population_attackers)
+#         return th.tensor(all_novelties[attacker_idx], device=self.device)
+#     
+    def _get_attacker_conditional_victim_distribution(self, attacker, batch):
         """
-        Extract behavioral characterization of an attacker.
+        NEW (MACO QD): Extract Conditional Victim Distribution as Behavior Descriptor.
+        
+        Behavior Vector V_φ = [p_1, p_2, ..., p_N]:
+        - p_i = Expected probability of attacking agent i (excluding No-Op)
+        - Uses softmax probabilities to capture stochastic attack preferences
+        
+        Key Insight:
+        - Uses expected probabilities (not greedy sampling) for stable behavior descriptors
+        - Ignores "No-Op" action (index N) by marginalizing over victim actions
+        - Forms a probability simplex over N agents (not N+1)
         
         Returns:
-            behavior_vector: Dictionary containing:
-                - victim_distribution: (n_agents+1,) distribution over victim choices
-                - attack_timing: (time_bins,) distribution of when attacks occur
-                - victim_entropy: Entropy of victim selection (diversity measure)
+            victim_dist: (N,) numpy array - Conditional probability over victims
         """
         with th.no_grad():
-            # Get victim selections across the batch
-            victim_ids_list = []
-            attack_q_values_list = []
+            bs = batch.batch_size
+            seq_len = batch.max_seq_length
+            n_agents = self.args.n_agents
             
-            for t in range(batch.max_seq_length - 1):
-                attacker_q = attacker.batch_forward(batch, t=t)  # (bs, n_agents+1)
-                victim_id = th.argmax(attacker_q, dim=-1)  # (bs,) greedy selection
-                
-                victim_ids_list.append(victim_id)
-                attack_q_values_list.append(attacker_q)
+            # FIXED (Bug 4): Use expected probabilities instead of greedy sampling
+            # Method: Compute softmax probabilities and average over time
+            all_probs_agents = []
+            for t in range(seq_len):
+                attacker_logits = attacker.batch_forward(batch, t)  # (bs, n_agents+1)
+                attack_probs = th.softmax(attacker_logits, dim=-1)  # (bs, n_agents+1)
+                attack_probs_agents_only = attack_probs[:, :n_agents]  # (bs, n_agents) - exclude No-Op
+                all_probs_agents.append(attack_probs_agents_only)
             
-            victim_ids = th.stack(victim_ids_list, dim=1)  # (bs, seq_len-1)
-            attack_q_values = th.stack(attack_q_values_list, dim=1)  # (bs, seq_len-1, n_agents+1)
+            all_probs_agents = th.stack(all_probs_agents, dim=1)  # (bs, seq_len, n_agents)
             
-            # Feature 1: Victim selection distribution
-            victim_distribution = th.zeros(self.args.n_agents + 1, device=self.device)
-            for i in range(self.args.n_agents + 1):
-                victim_distribution[i] = (victim_ids == i).float().mean()
+            # Expected victim distribution: average probability across batch and time
+            victim_dist = all_probs_agents.mean(dim=(0, 1))  # (n_agents,)
             
-            # Feature 2: Attack timing distribution (early, mid, late episode)
-            time_bins = 3
-            seq_len = victim_ids.shape[1]
-            attack_timing = th.zeros(time_bins, device=self.device)
+            # Renormalize (in case of numerical errors)
+            victim_dist_sum = victim_dist.sum()
+            if victim_dist_sum > 1e-8:
+                victim_dist = victim_dist / victim_dist_sum
+            else:
+                # Edge case: all probabilities near zero → uniform distribution
+                victim_dist = th.ones(n_agents, device=self.device) / n_agents
             
-            for bin_idx in range(time_bins):
-                start_t = (seq_len * bin_idx) // time_bins
-                end_t = (seq_len * (bin_idx + 1)) // time_bins
-                
-                # Count non-"no-attack" choices in this time bin
-                bin_victims = victim_ids[:, start_t:end_t]
-                attacks_in_bin = (bin_victims != self.args.n_agents).float().mean()
-                attack_timing[bin_idx] = attacks_in_bin
-            
-            # Feature 3: Victim entropy (diversity of targeting)
-            victim_probs = victim_distribution + 1e-8  # Add epsilon for stability
-            victim_probs = victim_probs / victim_probs.sum()  # Normalize
-            victim_entropy = -(victim_probs * th.log(victim_probs)).sum()
-            
-            # Combine into behavior vector
-            behavior_vector = {
-                'victim_distribution': victim_distribution,  # (n_agents+1,)
-                'attack_timing': attack_timing,  # (time_bins,)
-                'victim_entropy': victim_entropy.unsqueeze(0),  # (1,)
-            }
-            
-            return behavior_vector
+            return victim_dist.cpu().numpy()  # (N,)
     
-    def _behavioral_distance(self, behavior1, behavior2):
+    def _get_attacker_action_distribution_batch(self, attacker, batch):
         """
-        Compute distance between two behavioral characterizations.
+        DEPRECATED (kept for backward compatibility).
         
-        Uses weighted Euclidean distance across different behavior features.
+        OLD MECHANISM: Get action probability distribution for an attacker over ALL timesteps.
+        This function is replaced by _get_attacker_conditional_victim_distribution()
+        in the new QD framework.
+        
+        Uses attacker.batch_forward() to compute distributions for entire episode.
+        This captures the complete attack pattern: π(a|s,k) for all (s,k) in episode.
+        
+        Policy: π(a|s,k) = softmax(logits(s,k))
+        - Attacker network directly outputs logits over victim choices (n_agents+1 actions)
+        - Apply softmax to convert to probability distribution
+        
+        Args:
+            attacker: Attacker network
+            batch: Episode batch data
+            
+        Returns:
+            action_probs: (bs*seq_len, n_agents+1) probability distribution over all timesteps
         """
-        # Weight different features
-        w_victim = 1.0  # Victim selection pattern
-        w_timing = 0.5  # Attack timing
-        w_entropy = 0.3  # Victim diversity
-        
-        # Distance in victim selection space
-        dist_victim = th.norm(behavior1['victim_distribution'] - behavior2['victim_distribution'], p=2)
-        
-        # Distance in attack timing space
-        dist_timing = th.norm(behavior1['attack_timing'] - behavior2['attack_timing'], p=2)
-        
-        # Distance in entropy (scalar)
-        dist_entropy = th.abs(behavior1['victim_entropy'] - behavior2['victim_entropy']).squeeze()
-        
-        # Weighted combination
-        total_distance = (w_victim * dist_victim + 
-                         w_timing * dist_timing + 
-                         w_entropy * dist_entropy)
-        
-        return total_distance.item()
+        with th.no_grad():
+            bs = batch.batch_size
+            seq_len = batch.max_seq_length
+            
+            # Collect Q-values for all timesteps
+            all_q_values = []
+            for t in range(seq_len):
+                attacker_logits = attacker.batch_forward(batch, t)  # (bs, n_agents+1)
+                all_q_values.append(attacker_logits)
+            
+            all_q_values = th.stack(all_q_values, dim=1)  # (bs, seq_len, n_agents+1)
+            
+            # Reshape to (bs*seq_len, n_agents+1) for batch processing
+            logits_flat = all_q_values.reshape(-1, self.args.n_agents + 1)
+            
+            # Directly apply softmax to attacker's logits
+            # The attacker network outputs logits, not Q-values
+            # π(a|s,k) = softmax(logits(s,k))
+            action_probs = F.softmax(logits_flat, dim=-1)  # (bs*seq_len, n_agents+1)
+            
+            return action_probs
     
-    # ========== Attacker Memetic SGD Training (NEW APPROACH) ==========
-    def lamarckian_finetune_attacker(self, attacker, episode_batch, num_sgd_steps=1):
+    # ========== OLD BEHAVIOR-BASED NOVELTY FUNCTIONS (DEPRECATED) ==========
+    # Kept for reference, but no longer used in new KL-divergence approach
+    
+#     def _extract_attacker_behavior(self, batch, attacker):
+#         """
+#         [DEPRECATED] Extract behavioral characterization of an attacker.
+#         
+#         Returns:
+#             behavior_vector: Dictionary containing:
+#                 - victim_distribution: (n_agents+1,) distribution over victim choices
+#                 - attack_timing: (time_bins,) distribution of when attacks occur
+#                 - victim_entropy: Entropy of victim selection (diversity measure)
+#         """
+#         with th.no_grad():
+#             # Get victim selections across the batch
+#             victim_ids_list = []
+#             attack_q_values_list = []
+#             
+#             for t in range(batch.max_seq_length - 1):
+#                 attacker_q = attacker.batch_forward(batch, t=t)  # (bs, n_agents+1)
+#                 victim_id = th.argmax(attacker_q, dim=-1)  # (bs,) greedy selection
+#                 
+#                 victim_ids_list.append(victim_id)
+#                 attack_q_values_list.append(attacker_q)
+#             
+#             victim_ids = th.stack(victim_ids_list, dim=1)  # (bs, seq_len-1)
+#             attack_q_values = th.stack(attack_q_values_list, dim=1)  # (bs, seq_len-1, n_agents+1)
+#             
+#             # Feature 1: Victim selection distribution
+#             victim_distribution = th.zeros(self.args.n_agents + 1, device=self.device)
+#             for i in range(self.args.n_agents + 1):
+#                 victim_distribution[i] = (victim_ids == i).float().mean()
+#             
+#             # Feature 2: Attack timing distribution (early, mid, late episode)
+#             time_bins = 3
+#             seq_len = victim_ids.shape[1]
+#             attack_timing = th.zeros(time_bins, device=self.device)
+#             
+#             for bin_idx in range(time_bins):
+#                 start_t = (seq_len * bin_idx) // time_bins
+#                 end_t = (seq_len * (bin_idx + 1)) // time_bins
+#                 
+#                 # Count non-"no-attack" choices in this time bin
+#                 bin_victims = victim_ids[:, start_t:end_t]
+#                 attacks_in_bin = (bin_victims != self.args.n_agents).float().mean()
+#                 attack_timing[bin_idx] = attacks_in_bin
+#             
+#             # Feature 3: Victim entropy (diversity of targeting)
+#             victim_probs = victim_distribution + 1e-8  # Add epsilon for stability
+#             victim_probs = victim_probs / victim_probs.sum()  # Normalize
+#             victim_entropy = -(victim_probs * th.log(victim_probs)).sum()
+#             
+#             # Combine into behavior vector
+#             behavior_vector = {
+#                 'victim_distribution': victim_distribution,  # (n_agents+1,)
+#                 'attack_timing': attack_timing,  # (time_bins,)
+#                 'victim_entropy': victim_entropy.unsqueeze(0),  # (1,)
+#             }
+#             
+#             return behavior_vector
+#     
+#     def _behavioral_distance(self, behavior1, behavior2):
+#         """
+#         Compute distance between two behavioral characterizations.
+#         
+#         Uses weighted Euclidean distance across different behavior features.
+#         """
+#         # Weight different features
+#         w_victim = 1.0  # Victim selection pattern
+#         w_timing = 0.5  # Attack timing
+#         w_entropy = 0.3  # Victim diversity
+#         
+#         # Distance in victim selection space
+#         dist_victim = th.norm(behavior1['victim_distribution'] - behavior2['victim_distribution'], p=2)
+#         
+#         # Distance in attack timing space
+#         dist_timing = th.norm(behavior1['attack_timing'] - behavior2['attack_timing'], p=2)
+#         
+#         # Distance in entropy (scalar)
+#         dist_entropy = th.abs(behavior1['victim_entropy'] - behavior2['victim_entropy']).squeeze()
+#         
+#         # Weighted combination
+#         total_distance = (w_victim * dist_victim + 
+#                          w_timing * dist_timing + 
+#                          w_entropy * dist_entropy)
+#         
+#         return total_distance.item()
+#     
+#     # ========== Attacker Memetic SGD Training (NEW APPROACH) ==========
+    def memetic_finetune_attacker(self, attacker, episode_batch, num_sgd_steps=1):
         """
-        REFACTORED: Memetic SGD for Attacker using Budget-Modulated Attack Advantage.
-        Replaces old Soft Q-Learning with policy gradient-like approach.
+        REFACTORED V2: Memetic SGD for Attacker using Counterfactual Attack Advantage.
         
-        New Training Mechanism (MACO_overview.md V6):
-        1. Attack Advantage Function: A_att(j|s,k) = Q_j(s,u_j) - γ(k)·Q̄(s)
-        2. Budget Modulation: γ(k) = 1 + budget_lambda(K-k)/K (higher threshold when budget is scarce)
-        3. Policy Gradient Loss: L_att = -E[Σ A_att(j)·log π(j)]
+        New Training Mechanism (MACO QD):
+        1. Attack Utility: U_att(j|s) = Q_tot(s, u) - Q_tot(s, <u_worst_j, u_-j>)
+           - Measures the counterfactual drop in global Q when agent j is attacked
+        2. Budget Modulation: γ(k) = 1 + λ(K-k)/K (higher threshold when budget is scarce)
+        3. Attack Advantage: A_att(j|s,k) = U_att(j|s) - γ(k)·Ū(s)
+        4. Policy Gradient Loss: L_att = -E[Σ A_att(j)·log π(j)]
         
         Key Innovation:
-        - Teaches attacker "opportunity cost awareness" (好钢用在刀刃上)
-        - When budget is low, only attack high-value targets
-        - When budget is high, attack above-average targets
+        - Counterfactual reasoning: directly measures global value disruption
+        - Budget-aware opportunity cost: forces strategic target selection
+        - No environment interaction: purely offline based on defender's Q_tot
         
         Args:
             attacker: MLPAttacker instance to finetune
@@ -1120,8 +1243,6 @@ class MARCOLearner:
         # 3. Multi-step SGD finetuning
         for step in range(num_sgd_steps):
             # === Step 1: Get defender's local Q-values for all agents ===
-            # We need Q_j(s, u_j) for each agent j to compute attack advantage
-            # Use the main RL genome to get Q-values
             self.Genome.eval()
             self.Genome.init_hidden(batch.batch_size)
             
@@ -1137,21 +1258,76 @@ class MARCOLearner:
             actions = batch["actions"][:, :-1]  # (bs, seq_len-1, n_agents, 1)
             chosen_q = th.gather(agent_q, dim=3, index=actions).squeeze(3)  # (bs, seq_len-1, n_agents)
             
-            # === Step 2: Compute Attack Advantage ===
-            # Average Q across all agents: Q̄(s) = (1/N) Σ Q_j(s, u_j)
-            Q_bar = chosen_q.mean(dim=2, keepdim=True)  # (bs, seq_len-1, 1)
+            # === Step 2: Compute Counterfactual Attack Utility (OPTIMIZED: Batch Computation) ===
+            # For each agent j, compute: U_att(j) = Q_tot(u) - Q_tot(<u_worst_j, u_-j>)
             
-            # Budget modulation factor: γ(k) = 1 + budget_lambda(K-k)/K
+            # 2.1: Get Q_tot for normal actions
+            with th.no_grad():
+                Q_tot_normal = self.mixer(chosen_q, batch["state"][:, :-1])  # (bs, seq_len-1, 1)
+            
+            # 2.2: Batch compute Q_tot for ALL counterfactual scenarios at once
+            n_agents = self.args.n_agents
+            bs, seq_len, _ = chosen_q.shape
+            
+            # FIXED (Bug 2): Add dimension validation
+            assert batch["state"].shape[1] == batch.max_seq_length, \
+                f"State dim mismatch: {batch['state'].shape[1]} vs {batch.max_seq_length}"
+            assert batch["state"][:, :-1].shape[1] == seq_len, \
+                f"State sequence mismatch: {batch['state'][:, :-1].shape[1]} vs {seq_len}"
+            
+            # Find worst action for each agent: argmin Q_j(o_j, a)
+            worst_actions = agent_q.argmin(dim=3)  # (bs, seq_len-1, n_agents)
+            
+            # Get worst Q values for all agents
+            worst_q_values = th.gather(agent_q, dim=3, index=worst_actions.unsqueeze(-1)).squeeze(-1)  # (bs, seq_len-1, n_agents)
+            
+            # OPTIMIZED: Create diagonal mask to replace each agent's Q with worst Q one at a time
+            # Shape: (n_agents, bs, seq_len-1, n_agents)
+            # For scenario j: all agents use chosen_q except agent j uses worst_q_values
+            counterfactual_q_all = chosen_q.unsqueeze(0).expand(n_agents, -1, -1, -1).clone()  # (n_agents, bs, seq_len-1, n_agents)
+            
+            # Create index tensor for advanced indexing
+            agent_indices = th.arange(n_agents, device=self.device)
+            counterfactual_q_all[agent_indices, :, :, agent_indices] = worst_q_values.permute(2, 0, 1)  # Replace diagonal
+            
+            # Reshape for batch mixer computation: (n_agents * bs, seq_len-1, n_agents)
+            counterfactual_q_batch = counterfactual_q_all.reshape(n_agents * bs, seq_len, n_agents)
+            state_batch = batch["state"][:, :-1].unsqueeze(0).expand(n_agents, -1, -1, -1).reshape(n_agents * bs, seq_len, -1)
+            
+            # Single mixer call for all counterfactual scenarios!
+            with th.no_grad():
+                Q_tot_counterfactual_batch = self.mixer(counterfactual_q_batch, state_batch)  # (n_agents * bs, seq_len-1, 1)
+            
+            # Reshape back: (n_agents, bs, seq_len-1, 1)
+            Q_tot_counterfactual = Q_tot_counterfactual_batch.reshape(n_agents, bs, seq_len, 1)
+            
+            # Compute attack utilities: (n_agents, bs, seq_len-1) -> transpose to (bs, seq_len-1, n_agents)
+            attack_utilities = (Q_tot_normal.unsqueeze(0) - Q_tot_counterfactual).squeeze(-1).permute(1, 2, 0)
+            
+            # Ensure non-negative (due to monotonicity, should be ≥ 0)
+            attack_utilities = th.clamp(attack_utilities, min=0.0)  # (bs, seq_len-1, n_agents)
+            
+            # FIXED (Bug 3): Check for NaN in attack_utilities
+            if not th.isfinite(attack_utilities).all():
+                print("[WARNING] NaN detected in attack_utilities")
+                return float('inf')
+            
+            # === Step 3: Compute Budget-Aware Attack Advantage ===
+            # Baseline utility: average attack utility across all agents
+            U_bar = attack_utilities.mean(dim=2, keepdim=True)  # (bs, seq_len-1, 1)
+            
+            # Budget modulation factor: γ(k) = 1 + λ·(K-k)/K
+            # As remaining budget k decreases → (K-k) increases → γ increases (higher threshold)
             gamma_k = 1.0 + budget_lambda * (K - left_attack) / K  # (bs, seq_len-1, 1)
             
-            # Attack Advantage for each agent j: A_att(j) = Q_j - γ(k)·Q̄
-            attack_advantage = chosen_q - gamma_k * Q_bar  # (bs, seq_len-1, n_agents)
+            # Attack Advantage: A_att(j) = U_att(j) - γ(k)·Ū
+            attack_advantage = attack_utilities - gamma_k * U_bar  # (bs, seq_len-1, n_agents)
             
-            # For "no-attack" option (j=N+1), advantage is 0
+            # For "no-attack" option (j=N+1), advantage is 0 (baseline anchor)
             no_attack_advantage = th.zeros_like(attack_advantage[:, :, :1])  # (bs, seq_len-1, 1)
             attack_advantage_full = th.cat([attack_advantage, no_attack_advantage], dim=2)  # (bs, seq_len-1, n_agents+1)
             
-            # === Step 3: Get attacker's action probabilities ===
+            # === Step 4: Get attacker's action probabilities ===
             attacker_logits = []
             for t in range(batch.max_seq_length):
                 logit = attacker.batch_forward(batch, t=t)
@@ -1161,10 +1337,15 @@ class MARCOLearner:
             # Convert to log probabilities
             log_probs = th.log_softmax(attacker_logits, dim=-1)  # (bs, seq_len-1, n_agents+1)
             
-            # === Step 4: Policy Gradient Loss ===
+            # FIXED (Bug 3): Check for NaN in log_probs
+            if not th.isfinite(log_probs).all():
+                print("[WARNING] NaN detected in log_probs")
+                return float('inf')
+            
+            # === Step 5: Policy Gradient Loss ===
             # L_att = -E[Σ_j A_att(j) · log π(j)]
             # If A_att(j) > 0: High advantage → increase log π(j)  
-            # If A_att(j) < 0: Low advantage → decrease log π(j)
+            # If A_att(j) < 0 (all below baseline): advantage of No-Op (0) becomes highest
             policy_loss = -(attack_advantage_full * log_probs * mask).sum() / mask.sum()
             
             # Check if loss is valid
@@ -1180,113 +1361,152 @@ class MARCOLearner:
         # 4. Return final loss for monitoring
         return policy_loss.item()
     
-    # ========== DEPRECATED: Old Lamarckian Attacker Training ==========
-    # def _lamarckian_finetune_attacker_OLD_DEPRECATED(self, attacker, episode_batch, num_sgd_steps=1):
-    #     """
-    #     DEPRECATED: Old Lamarckian SGD微调for Attacker (replaced by budget-modulated advantage).
+    
+    # ============================================================================
+    # NEW: Quality-Diversity (QD) Framework for Attacker Evolution
+    # ============================================================================
+    
+    def quality_diversity_selection(self, batch, population_attackers, num_clusters=None):
+        """
+        NEW (MACO QD): Quality-Diversity Selection using K-Means Clustering.
         
-    #     与defender的Lamarckian不同:
-    #     - Defender优化: 最小化TD error (拟合环境)
-    #     - Attacker优化: 最大化negative reward (破坏defender性能)
+        Replaces NSGA-II dual-objective selection with explicit behavior space partitioning.
         
-    #     训练目标:
-    #     1. 主要: 最小化 defender reward (即最大化 -reward)
-    #     2. 辅助: 保持Soft Q-Learning的策略稀疏性
+        Algorithm:
+        1. Compute fitness (TD Error) for each attacker
+        2. Extract behavior vectors V_φ (Conditional Victim Distribution)
+        3. Cluster behavior space into K clusters via K-Means
+        4. Select best attacker (max TD Error) from each cluster
         
-    #     Args:
-    #         attacker: MLPAttacker instance to finetune
-    #         episode_batch: Recent episode batch for computing gradient
-    #         num_sgd_steps: Number of SGD steps to perform
-            
-    #     Returns:
-    #         final_loss: Final quality loss value (for monitoring)
-    #     """
-    #     # 1. 设置为训练模式
-    #     attacker.train()
+        Key Innovation:
+        - Explicit behavior diversity via clustering (not implicit Pareto front)
+        - Fitness is ONLY TD Error (single objective)
+        - Diversity is enforced by K-Means partitioning
+        - Ensures exploration of different attack strategies
         
-    #     # 2. 创建临时优化器 (使用较小学习率，避免破坏进化得到的权重)
-    #     finetune_lr = getattr(self.args, 'attacker_finetune_lr', self.args.attack_lr * 0.1)
-    #     finetune_optimizer = th.optim.RMSprop(
-    #         attacker.parameters(), 
-    #         lr=finetune_lr,
-    #         alpha=self.args.optim_alpha, 
-    #         eps=self.args.optim_eps
-    #     )
+        Args:
+            batch: Episode batch for fitness evaluation
+            population_attackers: List of attacker instances
+            num_clusters: Number of clusters (default: pop_size // 2)
+            
+        Returns:
+            elite_indices: Indices of selected attackers (one per cluster)
+            replace_indices: Indices of attackers to be replaced
+            fitness_dict: Dictionary with fitness and behavior info
+        """
+        from sklearn.cluster import KMeans
         
-    #     # 准备batch
-    #     max_ep_t = episode_batch.max_t_filled()
-    #     batch = episode_batch[:, :max_ep_t]
+        pop_size = len(population_attackers)
+        n_agents = self.args.n_agents
         
-    #     if batch.device != self.args.device:
-    #         batch.to(self.args.device)
+        # Default: half of population becomes elites
+        if num_clusters is None:
+            num_clusters = max(1, pop_size // 2)
         
-    #     # 提取数据
-    #     rewards = batch["reward"][:, :-1]  # Defender's reward
-    #     # if self.args.shaping_reward:
-    #     #     rewards = batch["shaping_reward"][:, :-1]
+        # === Step 1: Compute TD Error (Quality) for all attackers ===
+        td_errors = []
+        for i in range(pop_size):
+            with th.no_grad():
+                td_error = self.calculate_attacker_TD_error(
+                    batch, i, population_attackers
+                )
+            td_errors.append(td_error.item())
         
-    #     terminated = batch["terminated"][:, :-1].float()
-    #     mask = batch["filled"][:, :-1].float()
-    #     mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        td_errors = np.array(td_errors)
         
-    #     # 3. 执行多步SGD微调
-    #     for step in range(num_sgd_steps):
-    #         # Forward pass: 计算attacker的Q值
-    #         attacker_qs = []
-    #         for t in range(batch.max_seq_length):
-    #             attacker_q = attacker.batch_forward(batch, t=t)
-    #             attacker_qs.append(attacker_q)
-    #         attacker_qs = th.stack(attacker_qs, dim=1)  # (bs, seq_len, n_agents+1)
-            
-    #         # === Quality Objective: Maximize negative defender reward ===
-    #         # 策略: 选择能最大化负reward的victim
-    #         # 使用softmax得到victim选择概率分布
-    #         victim_logits = attacker_qs[:, :-1]  # (bs, seq_len-1, n_agents+1)
-    #         victim_probs = th.softmax(victim_logits, dim=-1)  # Temperature=0.1 for sharper distribution
-            
-    #         # 计算期望的victim选择下的reward
-    #         # 假设: 选择不同victim会导致不同的reward
-    #         # 简化为: 最大化选择"攻击"行为(非no-attack)的概率
-    #         attack_prob = 1.0 - victim_probs[:, :, -1]  # Probability of NOT choosing "no-attack"
-            
-    #         # Quality loss: 最小化defender reward，加权于攻击概率
-    #         # L_quality = E[reward * attack_prob] = 期望的defender损失
-    #         quality_loss = -(rewards.squeeze(-1) * attack_prob * mask.squeeze(-1)).sum() / mask.sum()
-            
-    #         # === Regularization: Soft Q-Learning稀疏性约束 ===
-    #         # 保持与p_ref的一致性，防止过度偏离稀疏攻击策略
-    #         # KL散度: D_KL(victim_probs || p_ref)
-    #         p_ref_expanded = attacker.p_ref.unsqueeze(0).unsqueeze(0).expand_as(victim_probs)
-    #         kl_div = (victim_probs * (th.log(victim_probs + 1e-8) - th.log(p_ref_expanded + 1e-8))).sum(dim=-1)
-            
-    #         reg_weight = getattr(self.args, 'attacker_finetune_reg', 0.01)
-    #         reg_loss = (kl_div * mask.squeeze(-1)).sum() / (mask.sum() + 1e-8)
-            
-    #         # Total loss
-    #         total_loss = quality_loss + reg_weight * reg_loss
-            
-    #         # 检查loss是否合理
-    #         if not th.isfinite(total_loss):
-    #             # Loss异常，停止微调
-    #             return float('inf')
-            
-    #         # Backward and optimize
-    #         finetune_optimizer.zero_grad()
-    #         total_loss.backward()
-            
-    #         # 梯度裁剪 (更保守)
-    #         grad_clip = getattr(self.args, 'attacker_finetune_grad_clip', self.args.grad_norm_clip * 0.5)
-    #         grad_norm = th.nn.utils.clip_grad_norm_(attacker.parameters(), grad_clip)
-            
-    #         # 检查梯度
-    #         if not th.isfinite(grad_norm):
-    #             finetune_optimizer.zero_grad()
-    #             return float('inf')
-            
-    #         finetune_optimizer.step()
+        # === Step 2: Extract Behavior Vectors (Diversity) - with progress tracking ===
+        behavior_vectors = []
+        for i, attacker in enumerate(population_attackers):
+            victim_dist = self._get_attacker_conditional_victim_distribution(attacker, batch)
+            behavior_vectors.append(victim_dist)
         
-    #     # 4. 设置回eval模式
-    #     attacker.eval()
+        behavior_vectors = np.array(behavior_vectors)  # (pop_size, N)
         
-    #     # 5. 返回最终loss (主要是quality loss)
-    #     return quality_loss.item()
+        # === Step 3: K-Means Clustering in Behavior Space (OPTIMIZED) ===
+        # FIXED (Bug 8): Check if behavior vectors are too similar (early training)
+        behavior_variance = np.var(behavior_vectors, axis=0).sum()
+        
+        if behavior_variance < 1e-6:
+            # All attackers have nearly identical behavior → random selection
+            print(f"[QD Selection WARNING] Behavior vectors too similar (var={behavior_variance:.2e}), using random selection")
+            elite_indices = np.random.choice(pop_size, size=min(num_clusters, pop_size), replace=False).tolist()
+            replace_indices = [i for i in range(pop_size) if i not in elite_indices]
+            
+            # Create dummy cluster labels
+            cluster_labels = np.zeros(pop_size, dtype=int)
+            for i, elite_idx in enumerate(elite_indices):
+                cluster_labels[elite_idx] = i
+            
+            fitness_dict = {
+                'td_errors': td_errors,
+                'behavior_vectors': behavior_vectors,
+                'cluster_labels': cluster_labels,
+                'elite_indices': elite_indices,
+                'replace_indices': replace_indices,
+                'warning': 'behavior_vectors_too_similar'
+            }
+            
+            return elite_indices, replace_indices, fitness_dict
+        
+        # Handle edge cases
+        if num_clusters >= pop_size:
+            # Each attacker is its own cluster
+            cluster_labels = np.arange(pop_size)
+        else:
+            # Optimized K-Means parameters:
+            # - n_init='auto' (faster, sklearn 1.4+) or 3 (legacy compatibility)
+            # - max_iter=100 (reduced from default 300)
+            # - tol=1e-3 (relaxed from default 1e-4)
+            try:
+                kmeans = KMeans(
+                    n_clusters=num_clusters, 
+                    random_state=42, 
+                    n_init='auto',  # sklearn 1.4+: adaptive initialization
+                    max_iter=100,    # Reduced iterations
+                    tol=1e-3         # Relaxed tolerance
+                )
+            except TypeError:
+                # Fallback for older sklearn versions
+                kmeans = KMeans(
+                    n_clusters=num_clusters, 
+                    random_state=42, 
+                    n_init=3,        # Reduced from default 10
+                    max_iter=100, 
+                    tol=1e-3
+                )
+            cluster_labels = kmeans.fit_predict(behavior_vectors)
+        
+        # === Step 4: Select Best Attacker from Each Cluster ===
+        elite_indices = []
+        for cluster_id in range(num_clusters):
+            # Get all attackers in this cluster
+            cluster_mask = (cluster_labels == cluster_id)
+            cluster_attackers = np.where(cluster_mask)[0]
+            
+            # FIXED (Bug 6): Handle empty clusters by selecting from existing elites
+            if len(cluster_attackers) == 0:
+                if len(elite_indices) > 0:
+                    # Fill with random existing elite to maintain num_clusters elites
+                    elite_indices.append(np.random.choice(elite_indices))
+                continue
+            
+            # Select attacker with highest TD Error in this cluster
+            cluster_td_errors = td_errors[cluster_attackers]
+            best_in_cluster = cluster_attackers[np.argmax(cluster_td_errors)]
+            elite_indices.append(int(best_in_cluster))
+        
+        # === Step 5: Determine Replace Indices ===
+        elite_set = set(elite_indices)
+        replace_indices = [i for i in range(pop_size) if i not in elite_set]
+        
+        # === Step 6: Return Results ===
+        fitness_dict = {
+            'td_errors': td_errors,
+            'behavior_vectors': behavior_vectors,
+            'cluster_labels': cluster_labels,
+            'elite_indices': elite_indices,
+            'replace_indices': replace_indices
+        }
+        
+        return elite_indices, replace_indices, fitness_dict
+    
