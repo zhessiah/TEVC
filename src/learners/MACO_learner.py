@@ -19,13 +19,13 @@ from controllers import REGISTRY as mac_REGISTRY
 class MACOLearner:
     def __init__(self, genome, pop_genome, scheme, logger, args):
         self.args = args
-        self.Genome = genome  # Single Genome (双MAC) for RL training
+        self.Genome = genome  # Single Genome (single MAC) for RL training
         self.logger = logger
         self.scheme = scheme  # Save scheme for creating population
         
         self.last_target_update_episode = 0
         self.device = th.device('cuda' if args.use_cuda  else 'cpu')
-        self.params = list(genome.parameters())  # This includes both mac1 and mac2 parameters
+        self.params = list(genome.parameters())  # This includes MAC parameters
 
         if args.mixer == "qatten":
             self.mixer = QattenMixer(args)
@@ -72,11 +72,11 @@ class MACOLearner:
             self.priority_min = float('inf')
             
         # Evolution: Unified Genome population
-        # Each Genome contains: mac1 + mac2 + mixer
+        # Each Genome contains: single MAC only 
         self.pop_size = args.pop_size
         self.elite_size = args.elite_size
         
-        self.pop_genome = pop_genome  # Population of Genomes (包含 MAC1 + MAC2 + Mixer)
+        self.pop_genome = pop_genome  # Population of Genomes 
         
         self.best_agents = list(range(int(self.pop_size*self.elite_size)))
         
@@ -105,7 +105,7 @@ class MACOLearner:
         Returns:
             mean_td_error: Mean TD error for the specified Genome (scalar tensor)
         """
-        # Get the Genome from population (contains mac1 and mac2)
+        # Get the Genome from population (contains single mac)
         pop_genome = self.pop_genome[genome_index]
         
         # Get the relevant quantities (same as in train())
@@ -116,49 +116,36 @@ class MACOLearner:
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
         
-        # Set both agents to eval mode for evaluation
-        pop_genome.mac1.agent.eval()
-        pop_genome.mac2.agent.eval()
+        # Set agent to eval mode for evaluation
+        pop_genome.mac.agent.eval()
         
         with th.no_grad():  # No gradients needed for evaluation
-            # Calculate Q-Values using mac1
-            mac_out_1 = []
-            pop_genome.mac1.init_hidden(batch.batch_size)
+            # Calculate Q-Values using mac
+            mac_out = []
+            pop_genome.mac.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length):
-                agent_outs = pop_genome.mac1.forward(batch, t=t)
-                mac_out_1.append(agent_outs)
-            mac_out_1 = th.stack(mac_out_1, dim=1)
-            
-            # Calculate Q-Values using mac2
-            mac_out_2 = []
-            pop_genome.mac2.init_hidden(batch.batch_size)
-            for t in range(batch.max_seq_length):
-                agent_outs = pop_genome.mac2.forward(batch, t=t)
-                mac_out_2.append(agent_outs)
-            mac_out_2 = th.stack(mac_out_2, dim=1)
+                agent_outs = pop_genome.mac.forward(batch, t=t)
+                mac_out.append(agent_outs)
+            mac_out = th.stack(mac_out, dim=1)
         
-        # Pick the Q-Values for the actions taken - for both MACs
-        chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions).squeeze(3)
-        chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions).squeeze(3)
+        # Pick the Q-Values for the actions taken
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
         
         # Calculate the Q-Values necessary for the target 
         with th.no_grad():
-            self.target_Genome.mac1.agent.eval()
-            self.target_Genome.mac2.agent.eval()
+            self.target_Genome.mac.agent.eval()
             
             # Target Q-values from target_Genome
             target_mac_out = []
             self.target_Genome.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length):
-                target_agent_outs = self.target_Genome.forward(batch, t=t)  # min(q1, q2)
+                target_agent_outs = self.target_Genome.forward(batch, t=t)
                 target_mac_out.append(target_agent_outs)
 
             target_mac_out = th.stack(target_mac_out, dim=1)
 
-            # Max over target Q-Values/ Double q learning 
-            # Use the minimum of mac1 and mac2 for action selection
-            mac_out_combined = th.min(mac_out_1, mac_out_2)
-            mac_out_detach = mac_out_combined.clone().detach()
+            # Max over target Q-Values / Double Q learning 
+            mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
@@ -176,70 +163,60 @@ class MACOLearner:
                 targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
                                                     self.args.n_agents, self.args.gamma, self.args.td_lambda)
 
-        # Mixer - for both MACs
+        # Mixer
         # Use the mixer from the population genome being evaluated
         with th.no_grad():
-            chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
-            chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
+            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
 
-        # Calculate TD error for both MACs and sum them
-        td_error_1 = (chosen_action_qvals_1 - targets.detach())
-        td_error2_1 = 0.5 * td_error_1.pow(2)
-        
-        td_error_2 = (chosen_action_qvals_2 - targets.detach())
-        td_error2_2 = 0.5 * td_error_2.pow(2)
+        # Calculate TD error
+        td_error = (chosen_action_qvals - targets.detach())
+        td_error2 = 0.5 * td_error.pow(2)
 
-        mask_expanded = mask.expand_as(td_error2_1)
-        masked_td_error_1 = td_error2_1 * mask_expanded
-        masked_td_error_2 = td_error2_2 * mask_expanded
+        mask_expanded = mask.expand_as(td_error2)
+        masked_td_error = td_error2 * mask_expanded
 
-        # Average TD errors from both MACs (not sum!)
-        mean_td_error_1 = masked_td_error_1.sum() / (mask_expanded.sum() + 1e-8)
-        mean_td_error_2 = masked_td_error_2.sum() / (mask_expanded.sum() + 1e-8)
-        mean_td_error = (mean_td_error_1 + mean_td_error_2) / 2.0  # Take average of both MACs
+        # Mean TD error
+        mean_td_error = masked_td_error.sum() / (mask.sum())
         
-        # Safety check: if TD error is unreasonably large, return infinity (mark as invalid)
-        if mean_td_error.item() > 1e6:
-            return th.tensor(1e6, device=mean_td_error.device)  # Cap at 1 million
-        
+
         return mean_td_error
 
 
-    # ========== SIMPLIFIED DEFENDER FITNESS FUNCTIONS (2 objectives only) ==========
-    # Following MACO refactoring:
-    # Defender Fitness (2 objectives):
-    # 1. Optimality: TD Error (calculate_TD_error) - environment fitting accuracy
-    # 2. Robustness: Fault Isolation Ratio (calculate_adversarial_loss) - Byzantine fault tolerance
-    #
-    # REMOVED deprecated functions (moved to implicit mechanisms):
-    # - calculate_confidence_Q: Redundant with TD error
-    # - calculate_adversarial_entropy: Complexity reduction  
-    # - calculate_influence_constraint: Complexity reduction
-    # - calculate_evolutionary_consensus: Implicit via Pareto front
-    # - calculate_adversarial_novelty: Diversity via exploration
-    # =================================================================================
-    
-    def calculate_adversarial_loss(self, batch, genome_index):
+    def calculate_adversarial_loss(self, batch, genome_index, population_attackers=None):
         """
-        Fitness 3: 故障隔离率 (Fault Isolation Ratio)
+        Fitness 2 (CORRECTED): Adversarial Q-Value Expectation (对抗价值期望)
         
-        计算 Mixer 对拜占庭故障 Agent 的隔离能力。
-        场景: 假设 Agent k 发生拜占庭故障（输出最差/随机 Q 值）
+        NEW MECHANISM (V7 - Critical Fix):
+        计算防御者在受攻击情况下的 Q 值期望，优化目标是 **最大化** 对抗 Q 值。
         
-        数学定义: 负的 Global/Local 敏感度比率
-        F3 = -E[|Q_tot(u_normal) - Q_tot(u_faulty)| / (|Q_k - Q'_k| + ε)]
+        数学定义:
+        J_2(θ) = E_s [ min_φ Q_tot(s, u_φ(s); θ) ]
         
         物理含义:
-        - 分母: 故障的严重程度（Local Q 的变化）
-        - 分子: Global Q 受到的波及程度
-        - 比率越小 => Mixer 成功隔离故障影响（W_k → 0）
+        - 不再追求"Q值稳定不变"（错误的指标）
+        - 而是追求"在最坏攻击下，Q值依然尽可能高"（正确的对抗目标）
+        - 筛选出那些"被攻击后依然认为自己能获得高回报"的防御者
+        - 进化压力：Q值掉得太厉害的个体（认为自己死定了）会被淘汰
+        
+        Implementation:
+        1. 从当前 batch 中获取受攻击的动作序列（已记录在 batch["byzantine_actions"] 中）
+        2. 使用这些被攻击的动作计算 Q_tot（无需环境交互，完全离线）
+        3. 对多个采样的攻击者取 min（最坏情况）
+        4. 返回期望值（越大越好）
+        
+        Key Differences from Old Approach:
+        - OLD: -|ΔQ_tot| / |ΔQ_k| (错误：追求数值稳定性)
+        - NEW: E[min_φ Q_tot(attacked)] (正确：追求对抗价值最大化)
         
         Args:
             batch: EpisodeBatch containing experience data
+                   Must have: actions, byzantine_actions, victim_id, state, obs
             genome_index: Index of the Genome in self.pop_genome to evaluate
+            population_attackers: List of attacker instances for sampling (optional)
+                                If None, uses batch's recorded attacker
             
         Returns:
-            mean_isolation_ratio: 负的平均隔离比率（越大越好）
+            adversarial_q_value: Mean Q_tot under adversarial actions (higher is better)
         """
         # Get the Genome from population
         pop_genome = self.pop_genome[genome_index]
@@ -248,94 +225,98 @@ class MACOLearner:
         terminated = batch["terminated"][:, :-1].float()
         mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        actions = batch["actions"][:, :-1]
         
         # Set to eval mode
         pop_genome.eval()
         
-        # === Step 1: 计算正常情况下的 Q 值 ===
+        # === Step 1: Get adversarial actions from batch ===
+        # These are the actions actually executed under attack (recorded during data collection)
+        byzantine_actions = batch["byzantine_actions"][:, :-1]  # (batch, seq_len-1, n_agents, 1)
+        victim_ids = batch["victim_id"][:, :-1]  # (batch, seq_len-1, 1)
+        original_actions = batch["actions"][:, :-1]  # (batch, seq_len-1, n_agents, 1)
+        
+        # Construct adversarial action sequence: 
+        # For each timestep, if victim_id < n_agents, use byzantine_action for that agent
+        n_agents = self.args.n_agents
+        batch_size = batch.batch_size
+        seq_len = byzantine_actions.shape[1]
+        
+        adversarial_actions = original_actions.clone()
+        for b in range(batch_size):
+            for t in range(seq_len):
+                victim = victim_ids[b, t, 0].item()
+                victim = int(victim)
+                if victim < n_agents:  # Valid attack (not "no-attack")
+                    adversarial_actions[b, t, victim] = byzantine_actions[b, t, victim]
+        
+        # === Step 2: Compute Q-values under adversarial actions ===
         pop_genome.init_hidden(batch.batch_size)
-        normal_agent_q_list = []
+        agent_q_list = []
         
         with th.no_grad():
             for t in range(batch.max_seq_length):
-                agent_out = pop_genome.forward(batch, t=t)  # min(q1, q2)
-                normal_agent_q_list.append(agent_out)
+                agent_out = pop_genome.forward(batch, t=t)  # (bs, n_agents, n_actions)
+                agent_q_list.append(agent_out)
         
-        normal_agent_q = th.stack(normal_agent_q_list, dim=1)  # (batch, seq_len, n_agents, n_actions)
-        normal_chosen_q = th.gather(normal_agent_q[:, :-1], dim=3, index=actions).squeeze(3)  # (batch, seq_len-1, n_agents)
+        agent_q = th.stack(agent_q_list, dim=1)[:, :-1]  # (batch, seq_len-1, n_agents, n_actions)
         
-        # 计算正常的 Global Q
+        # Pick Q-values for adversarial actions
+        adversarial_q = th.gather(agent_q, dim=3, index=adversarial_actions).squeeze(3)  # (batch, seq_len-1, n_agents)
+        
+        # === Step 3: Compute Global Q_tot under attack ===
         with th.no_grad():
-            normal_global_q = self.mixer(normal_chosen_q, batch["state"][:, :-1])  # (batch, seq_len-1, 1)
+            adversarial_q_tot = self.mixer(adversarial_q, batch["state"][:, :-1])  # (batch, seq_len-1, 1)
         
-        # === Step 2: 使用攻击者选择的 Agent 进行故障注入 ===
-        n_agents = self.args.n_agents
-        batch_size = batch.batch_size
-        seq_len = normal_chosen_q.shape[1]
+        # === Step 4: Apply mask and compute mean ===
+        masked_q_tot = adversarial_q_tot * mask
+        mean_adversarial_q = masked_q_tot.sum() / (mask.sum() + 1e-8)
         
-        # 使用batch中记录的攻击者选择的受害者 (由Attacker网络选择)
-        # victim_id shape: (batch, seq_len, 1), 值为 [0, n_agents], n_agents表示"不攻击"
-        victim_ids = batch["victim_id"][:, :-1].squeeze(-1)  # (batch, seq_len-1)
-        
-        # 对每个样本,选择该样本中最常被攻击的Agent作为故障Agent
-        # 如果全是no-attack(n_agents),则随机选择
-        faulty_agent_indices = th.zeros(batch_size, dtype=th.long, device=self.device)
-        for b in range(batch_size):
-            victim_counts = th.bincount(victim_ids[b].long(), minlength=n_agents+1)[:n_agents]
-            if victim_counts.sum() > 0:  # 有实际攻击发生
-                faulty_agent_indices[b] = victim_counts.argmax()
-            else:  # 该样本中没有攻击,随机选择
-                faulty_agent_indices[b] = th.randint(0, n_agents, (1,), device=self.device)
-        
-        # === Step 3: 注入拜占庭故障 ===
-        faulty_chosen_q = normal_chosen_q.clone()  # (batch, seq_len-1, n_agents)
-        
-        # 故障类型: 随机扰动或设为最差值
-        fault_type = getattr(self.args, 'fault_type', 'worst')
-        
-        for b in range(batch_size):
-            k = faulty_agent_indices[b].item()
+        # === Optional: Sample multiple attackers and take min (worst-case) ===
+        # If population_attackers is provided, we can compute Q_tot for multiple attack strategies
+        # and take the minimum (most pessimistic estimate)
+        if population_attackers is not None and len(population_attackers) > 0:
+            num_attacker_samples = min(3, len(population_attackers))  # Sample 3 attackers
+            sampled_attackers = np.random.choice(
+                len(population_attackers), 
+                size=num_attacker_samples, 
+                replace=False
+            )
             
-            if fault_type == 'worst':
-                # 设置为该 batch 该 agent 的最小 Q 值（最差动作）
-                min_q = normal_chosen_q[b, :, k].min()
-                faulty_chosen_q[b, :, k] = min_q
-            elif fault_type == 'random':
-                # 随机噪声
-                noise = th.randn_like(faulty_chosen_q[b, :, k]) * 0.5
-                faulty_chosen_q[b, :, k] = normal_chosen_q[b, :, k] + noise
-            else:  # 'zero'
-                faulty_chosen_q[b, :, k] = 0.0
+            all_adversarial_q = [mean_adversarial_q]
+            
+            for attacker_idx in sampled_attackers:
+                attacker = population_attackers[attacker_idx]
+                attacker.eval()
+                
+                # Recompute adversarial actions using this attacker's strategy
+                counterfactual_actions = original_actions.clone()
+                
+                with th.no_grad():
+                    for t in range(seq_len + 1):  # +1 because we need full sequence
+                        if t >= batch.max_seq_length:
+                            break
+                        attacker_logits = attacker.batch_forward(batch, t)  # (bs, n_agents+1)
+                        victim_id = attacker_logits.argmax(dim=1)  # (bs,)
+                        
+                        for b in range(batch_size):
+                            victim = victim_id[b].item()
+                            if victim < n_agents and t < seq_len:
+                                counterfactual_actions[b, t, victim] = byzantine_actions[b, t, victim]
+                
+                # Compute Q_tot for this attack strategy
+                counterfactual_q = th.gather(agent_q, dim=3, index=counterfactual_actions).squeeze(3)
+                with th.no_grad():
+                    counterfactual_q_tot = self.mixer(counterfactual_q, batch["state"][:, :-1])
+                
+                masked_q = counterfactual_q_tot * mask
+                mean_q = masked_q.sum() / (mask.sum() + 1e-8)
+                all_adversarial_q.append(mean_q)
+            
+            # Take minimum across sampled attackers (worst-case robustness)
+            mean_adversarial_q = th.stack(all_adversarial_q).min()
         
-        # 计算故障情况下的 Global Q
-        with th.no_grad():
-            faulty_global_q = self.mixer(faulty_chosen_q, batch["state"][:, :-1])  # (batch, seq_len-1, 1)
-        
-        # === Step 4: 计算隔离比率 ===
-        # 分子: Global Q 的变化（波及程度）
-        global_delta = th.abs(normal_global_q - faulty_global_q)  # (batch, seq_len-1, 1)
-        
-        # 分母: Local Q 的变化（故障严重程度）
-        local_delta_list = []
-        for b in range(batch_size):
-            k = faulty_agent_indices[b].item()
-            local_change = th.abs(normal_chosen_q[b, :, k] - faulty_chosen_q[b, :, k])  # (seq_len-1,)
-            local_delta_list.append(local_change)
-        
-        local_delta = th.stack(local_delta_list, dim=0).unsqueeze(-1)  # (batch, seq_len-1, 1)
-        
-        # 隔离比率 = Global 变化 / Local 变化
-        # 加 epsilon 防止除零
-        epsilon = 1e-6
-        isolation_ratio = global_delta / (local_delta + epsilon)  # (batch, seq_len-1, 1)
-        
-        # 应用 mask 并计算平均
-        masked_ratio = isolation_ratio * mask
-        mean_isolation_ratio = masked_ratio.sum() / (mask.sum() + 1e-8)
-        
-        # 返回负值（比率越小，fitness 越高）
-        return -mean_isolation_ratio
+        # Return the adversarial Q-value (higher is better for defender)
+        return mean_adversarial_q
     
     # ========== REMOVED DEPRECATED FITNESS FUNCTIONS ==========
     # Following MACO refactoring - complexity reduction
@@ -360,31 +341,21 @@ class MACOLearner:
         avail_actions = batch["avail_actions"]
                 
         
-        # Calculate estimated Q-Values for BOTH MACs in Genome
-        self.Genome.train()  # Set both mac1 and mac2 to train mode
+        # Calculate estimated Q-Values for MAC in Genome
+        self.Genome.train()  # Set mac to train mode
         
-        # Forward pass for mac1
-        mac_out_1 = []
-        self.Genome.mac1.init_hidden(batch.batch_size)
-        
-        for t in range(batch.max_seq_length):
-            agent_outs_1 = self.Genome.mac1.forward(batch, t=t)
-            mac_out_1.append(agent_outs_1)
-            
-        # Forward pass for mac2
-        mac_out_2 = []
-        self.Genome.mac2.init_hidden(batch.batch_size)
+        # Forward pass for mac
+        mac_out = []
+        self.Genome.mac.init_hidden(batch.batch_size)
         
         for t in range(batch.max_seq_length):
-            agent_outs_2 = self.Genome.mac2.forward(batch, t=t)
-            mac_out_2.append(agent_outs_2)
+            agent_outs = self.Genome.mac.forward(batch, t=t)
+            mac_out.append(agent_outs)
             
-        mac_out_1 = th.stack(mac_out_1, dim=1)  # (batch, seq_len, n_agents, n_actions)
-        mac_out_2 = th.stack(mac_out_2, dim=1)  # (batch, seq_len, n_agents, n_actions)
+        mac_out = th.stack(mac_out, dim=1)  # (batch, seq_len, n_agents, n_actions)
         
-        # Pick the Q-Values for the actions taken by each agent - for both MACs
-        chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions).squeeze(3)
-        chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions).squeeze(3)
+        # Pick the Q-Values for the actions taken by each agent
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
 
         # Calculate the Q-Values necessary for the target
         with th.no_grad():
@@ -392,15 +363,13 @@ class MACOLearner:
             target_mac_out = []
             self.target_Genome.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length):
-                target_agent_outs = self.target_Genome.forward(batch, t=t)  # min(q1, q2)
+                target_agent_outs = self.target_Genome.forward(batch, t=t)
                 target_mac_out.append(target_agent_outs)
 
             target_mac_out = th.stack(target_mac_out, dim=1)  # Concat across time
 
-            # Max over target Q-Values/ Double q learning
-            # Use min(mac1, mac2) for action selection
-            mac_out_combined = th.min(mac_out_1, mac_out_2)
-            mac_out_detach = mac_out_combined.clone().detach()
+            # Max over target Q-Values
+            mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
@@ -418,31 +387,23 @@ class MACOLearner:
                 targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals, 
                                                     self.args.n_agents, self.args.gamma, self.args.td_lambda)
 
-        # Mixer - for both MACs
-        chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
-        chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
+        # Mixer
+        chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
 
-        # Calculate TD error for BOTH MACs
-        td_error_1 = (chosen_action_qvals_1 - targets.detach())
-        td_error2_1 = 0.5 * td_error_1.pow(2)
-        
-        td_error_2 = (chosen_action_qvals_2 - targets.detach())
-        td_error2_2 = 0.5 * td_error_2.pow(2)
+        # Calculate TD error
+        td_error = (chosen_action_qvals - targets.detach())
+        td_error2 = 0.5 * td_error.pow(2)
 
-        mask = mask.expand_as(td_error2_1)
-        masked_td_error_1 = td_error2_1 * mask
-        masked_td_error_2 = td_error2_2 * mask
+        mask = mask.expand_as(td_error2)
+        masked_td_error = td_error2 * mask
 
         # important sampling for PER
         if self.use_per:
             per_weight = th.from_numpy(per_weight).unsqueeze(-1).to(device=self.device)
-            masked_td_error_1 = masked_td_error_1.sum(1) * per_weight
-            masked_td_error_2 = masked_td_error_2.sum(1) * per_weight
+            masked_td_error = masked_td_error.sum(1) * per_weight
 
-        # Sum TD errors from both MACs - this is the key change!
-        L_td_1 = masked_td_error_1.sum() / mask.sum()
-        L_td_2 = masked_td_error_2.sum() / mask.sum()
-        L_td = L_td_1 + L_td_2  # Total loss is sum of both MACs
+        # Calculate loss
+        L_td = masked_td_error.sum() / mask.sum()
         loss = L_td
         
         # Optimise
@@ -459,21 +420,15 @@ class MACOLearner:
             self.logger.log_stat("loss_td", L_td.item(), t_env)
             self.logger.log_stat("grad_norm", grad_norm, t_env)
             mask_elems = mask.sum().item()
-            # Use combined masked_td_error for logging
-            masked_td_error_combined = masked_td_error_1 + masked_td_error_2
-            self.logger.log_stat("td_error_abs", (masked_td_error_combined.abs().sum().item()/mask_elems), t_env)
-            # Use average of both MACs for q_taken_mean
-            chosen_action_qvals_avg = (chosen_action_qvals_1 + chosen_action_qvals_2) / 2.0
-            self.logger.log_stat("q_taken_mean", (chosen_action_qvals_avg * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
+            self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
+            self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             
             self.log_stats_t = t_env
             
             # print estimated matrix
             if self.args.env == "one_step_matrix_game":
-                # Use combined mac_out for matrix status
-                mac_out_combined = th.min(mac_out_1, mac_out_2)
-                print_matrix_status(batch, self.mixer, mac_out_combined)
+                print_matrix_status(batch, self.mixer, mac_out)
 
         # return info
         info = {}
@@ -487,9 +442,7 @@ class MACOLearner:
                 info["td_errors_abs"] = (info["td_errors_abs"] - self.priority_min) \
                                 / (self.priority_max - self.priority_min + 1e-5)
             else:
-                # Use combined td_error from both MACs
-                td_error_combined = td_error_1 + td_error_2
-                info["td_errors_abs"] = ((td_error_combined.abs() * mask).sum(1) \
+                info["td_errors_abs"] = ((td_error.abs() * mask).sum(1) \
                                 / th.sqrt(mask.sum(1))).detach().to('cpu')
         
         # Store TD error for learning-assisted dynamic weighting
@@ -498,182 +451,6 @@ class MACOLearner:
         
         return info
     
-#     def memetic_finetune(self, pop_genome, batch, num_sgd_steps=1):
-#         """
-#         DEPRECATED: This function is kept for backward compatibility only.
-#         According to MACO refactoring, explicit memetic learning is REMOVED.
-#         
-#         Rationale from document:
-#         "我们可以novel一些，不再说'memetic learning' 而是'memetic injection模因注入/文化注入'。
-#         然后去掉原本的memetic learning的过程。"
-#         
-#         The main agent learning (train()) itself IS the implicit memetic mechanism:
-#         - Main agent learns via SGD (TD error minimization)
-#         - Parameters are injected to replace dominated individuals (memetic injection)
-#         - This is equivalent to Value-Evolutionary-Based Reinforcement Learning
-#         
-#         DO NOT CALL THIS FUNCTION IN NEW CODE.
-#         Use only: rl_to_evo_excluding_elites() for parameter injection.
-#         
-#         Original description:
-#         Memetic SGD Injection: 对种群中的单个 Genome 进行 SGD 微调。
-#         
-#         **Memetic 特性**: 微调直接修改个体的权重（基因），因此获得的改进会遗传给后代。
-#         与达尔文进化不同，这里"后天学习"的结果会改变遗传信息。
-#         
-#         Args:
-#             pop_genome: 要微调的 Genome（来自 self.pop_genome）
-#             batch: EpisodeBatch 用于 SGD 训练
-#             num_sgd_steps: SGD 迭代次数（默认 1）
-#             
-#         Returns:
-#             td_loss: 微调后的 TD 损失（用于监控）
-#         """
-#         # 1. 为该个体创建临时优化器（避免影响主 RL 优化器）
-#         genome_params = list(pop_genome.parameters())
-#         
-#         # 使用更保守的学习率进行微调（防止破坏进化得到的结构和梯度爆炸）
-#         finetune_lr = getattr(self.args, 'finetune_lr', self.args.lr * 0.01)  # 改为 0.01 (更保守)
-#         
-#         if self.args.optimizer == 'adam':
-#             genome_optimizer = Adam(params=genome_params, lr=finetune_lr)
-#         else:
-#             genome_optimizer = RMSprop(params=genome_params, lr=finetune_lr, 
-#                                       alpha=self.args.optim_alpha, eps=self.args.optim_eps)
-#         
-#         # 初始化 loss（防止循环内跳过导致未定义）
-#         L_td = th.tensor(0.0, device=self.device)
-#         
-#         # 2. 执行 SGD 步骤
-#         for _ in range(num_sgd_steps):
-#             # Get the relevant quantities
-#             rewards = batch["reward"][:, :-1]
-#             actions = batch["actions"][:, :-1]
-#             terminated = batch["terminated"][:, :-1].float()
-#             mask = batch["filled"][:, :-1].float()
-#             mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-#             avail_actions = batch["avail_actions"]
-#             
-#             # Set to train mode
-#             pop_genome.train()
-#             
-#             # Forward pass for mac1
-#             mac_out_1 = []
-#             pop_genome.mac1.init_hidden(batch.batch_size)
-#             for t in range(batch.max_seq_length):
-#                 agent_outs_1 = pop_genome.mac1.forward(batch, t=t)
-#                 mac_out_1.append(agent_outs_1)
-#             
-#             # Forward pass for mac2
-#             mac_out_2 = []
-#             pop_genome.mac2.init_hidden(batch.batch_size)
-#             for t in range(batch.max_seq_length):
-#                 agent_outs_2 = pop_genome.mac2.forward(batch, t=t)
-#                 mac_out_2.append(agent_outs_2)
-#             
-#             mac_out_1 = th.stack(mac_out_1, dim=1)
-#             mac_out_2 = th.stack(mac_out_2, dim=1)
-#             
-#             # Pick Q-values for actions taken
-#             chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions).squeeze(3)
-#             chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions).squeeze(3)
-#             
-#             # Calculate targets using pop_genome itself (detached to avoid gradients)
-#             # 关键修复：不使用 self.target_Genome，而是用 pop_genome 自己的 detached 版本
-#             with th.no_grad():
-#                 # 使用 pop_genome 自己来计算目标（而非主 RL 的 target 网络）
-#                 pop_genome.eval()  # 临时设为 eval 模式计算目标
-#                 
-#                 # 计算目标 Q 值
-#                 target_mac_out_1 = []
-#                 pop_genome.mac1.init_hidden(batch.batch_size)
-#                 for t in range(batch.max_seq_length):
-#                     target_agent_outs = pop_genome.mac1.forward(batch, t=t)
-#                     target_mac_out_1.append(target_agent_outs)
-#                 
-#                 target_mac_out_2 = []
-#                 pop_genome.mac2.init_hidden(batch.batch_size)
-#                 for t in range(batch.max_seq_length):
-#                     target_agent_outs = pop_genome.mac2.forward(batch, t=t)
-#                     target_mac_out_2.append(target_agent_outs)
-#                 
-#                 target_mac_out_1 = th.stack(target_mac_out_1, dim=1)
-#                 target_mac_out_2 = th.stack(target_mac_out_2, dim=1)
-#                 
-#                 # 使用 min(Q1, Q2) 作为目标（Double Q-learning 的保守估计）
-#                 target_mac_out = th.min(target_mac_out_1, target_mac_out_2)
-#                 
-#                 # Double Q-learning: 使用当前网络选择动作，目标网络评估
-#                 mac_out_combined = th.min(mac_out_1, mac_out_2)
-#                 mac_out_detach = mac_out_combined.clone().detach()
-#                 mac_out_detach[avail_actions == 0] = -9999999
-#                 cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
-#                 target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
-#                 
-#                 # 使用 pop_genome 的 mixer（而非 self.target_mixer）
-#                 target_max_qvals = self.mixer(target_max_qvals, batch["state"])
-#                 
-#                 if getattr(self.args, 'q_lambda', False):
-#                     qvals = th.gather(target_mac_out, 3, batch["actions"]).squeeze(3)
-#                     qvals = self.mixer(qvals, batch["state"])
-#                     targets = build_q_lambda_targets(rewards, terminated, mask, target_max_qvals, qvals,
-#                                                     self.args.gamma, self.args.td_lambda)
-#                 else:
-#                     targets = build_td_lambda_targets(rewards, terminated, mask, target_max_qvals,
-#                                                      self.args.n_agents, self.args.gamma, self.args.td_lambda)
-#                 
-#                 pop_genome.train()  # 恢复训练模式
-#             
-#             # Apply mixer from pop_genome
-#             chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
-#             chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
-#             
-#             # Calculate TD error
-#             td_error_1 = (chosen_action_qvals_1 - targets.detach())
-#             td_error2_1 = 0.5 * td_error_1.pow(2)
-#             
-#             td_error_2 = (chosen_action_qvals_2 - targets.detach())
-#             td_error2_2 = 0.5 * td_error_2.pow(2)
-#             
-#             mask_expanded = mask.expand_as(td_error2_1)
-#             masked_td_error_1 = td_error2_1 * mask_expanded
-#             masked_td_error_2 = td_error2_2 * mask_expanded
-#             
-#             # Total loss
-#             L_td_1 = masked_td_error_1.sum() / (mask_expanded.sum() + 1e-8)
-#             L_td_2 = masked_td_error_2.sum() / (mask_expanded.sum() + 1e-8)
-#             L_td = L_td_1 + L_td_2
-#             
-#             # 检查 loss 是否有效（防止 NaN/Inf 传播）
-#             if not th.isfinite(L_td):
-#                 # Loss 无效，跳过此次更新
-#                 return float('inf')
-#             
-#             # 限制 loss 的最大值（防止梯度爆炸）
-#             max_loss = getattr(self.args, 'max_finetune_loss', 100.0)
-#             if L_td.item() > max_loss:
-#                 # Loss 过大，使用裁剪后的 loss
-#                 L_td = th.clamp(L_td, max=max_loss)
-#             
-#             # Optimize
-#             genome_optimizer.zero_grad()
-#             L_td.backward()
-#             
-#             # 更严格的梯度裁剪
-#             grad_norm_clip = getattr(self.args, 'finetune_grad_clip', self.args.grad_norm_clip * 0.5)
-#             grad_norm = th.nn.utils.clip_grad_norm_(genome_params, grad_norm_clip)
-#             
-#             # 检查梯度是否有效
-#             if not th.isfinite(grad_norm):
-#                 # 梯度无效，跳过此次更新
-#                 genome_optimizer.zero_grad()
-#                 return float('inf')
-#             
-#             genome_optimizer.step()
-#         
-#         # 3. 返回最终损失（用于监控微调效果）
-#         return L_td.item()
-# 
     def _update_targets(self):
         self.target_Genome.load_state(self.Genome)
         if self.mixer is not None:
@@ -683,7 +460,6 @@ class MACOLearner:
     def cuda(self):
         self.Genome.cuda()
         self.target_Genome.cuda()
-        # 移动种群到CUDA (每个 Genome 包含 mac1, mac2, mixer)
         for pop_genome in self.pop_genome:
             pop_genome.cuda()
         if self.mixer is not None:
@@ -704,44 +480,6 @@ class MACOLearner:
             self.mixer.load_state_dict(th.load("{}/mixer.th".format(path), map_location=lambda storage, loc: storage))
         self.optimiser.load_state_dict(th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage))
 
-    # ========== Attacker Fitness Calculation ==========
-#     def calculate_attacker_quality(self, batch, attacker_idx, population_attackers):
-#         """
-#         DEPRECATED: This function is no longer used in run.py (refactoring).
-#         
-#         The correct approach is to run environment with EACH attacker separately in run.py:
-#         ```python
-#         genome.mac1.set_attacker(population_attackers[i])
-#         attacker_eval_batch = runner.run(genome, test_mode=False)
-#         quality = -attacker_eval_batch["reward"].mean()
-#         ```
-#         
-#         Kept for backward compatibility only.
-#         
-#         Original (incorrect) implementation:
-#         Calculate attack quality: negative mean episode return (lower defender reward = better).
-#         
-#         Problem: This function computed quality from a shared batch, causing all attackers
-#         to have identical quality values. Fixed in by running separate evaluations.
-#         
-#         Args:
-#             batch: Episode batch data (SHARED - this was the bug!)
-#             attacker_idx: Index of attacker in population (unused - this was the bug!)
-#             population_attackers: List of all attacker instances
-#             
-#         Returns:
-#             mean_return: Mean episode return (scalar tensor)
-#         """
-#         # Extract rewards from batch
-#         rewards = batch["reward"][:, :-1]  # [batch_size, T, 1]
-#         mask = batch["filled"][:, :-1].float()  # [batch_size, T, 1]
-#         
-#         # Compute episode returns
-#         episode_returns = (rewards * mask).sum(dim=1) / mask.sum(dim=1)  # [batch_size, 1]
-#         mean_return = episode_returns.mean()
-#         
-#         return mean_return
-#     
     def calculate_attacker_TD_error(self, batch: EpisodeBatch, attacker_idx: int, population_attackers):
         """
         CORRECTED: Calculate attacker fitness via TD Error maximization with COUNTERFACTUAL ACTIONS.
@@ -828,26 +566,17 @@ class MACOLearner:
             # NOTE: We DON'T set attacker on MACs because Byzantine attack affects ACTIONS, not observations
             # The disruption comes from counterfactual_actions, not from perturbed observations
             
-            # Calculate Q-Values using mac1
-            mac_out_1 = []
-            self.Genome.mac1.init_hidden(batch.batch_size)
+            # Calculate Q-Values using mac
+            mac_out = []
+            self.Genome.mac.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length):
-                agent_outs = self.Genome.mac1.forward(batch, t=t)
-                mac_out_1.append(agent_outs)
-            mac_out_1 = th.stack(mac_out_1, dim=1)
-            
-            # Calculate Q-Values using mac2
-            mac_out_2 = []
-            self.Genome.mac2.init_hidden(batch.batch_size)
-            for t in range(batch.max_seq_length):
-                agent_outs = self.Genome.mac2.forward(batch, t=t)
-                mac_out_2.append(agent_outs)
-            mac_out_2 = th.stack(mac_out_2, dim=1)
+                agent_outs = self.Genome.mac.forward(batch, t=t)
+                mac_out.append(agent_outs)
+            mac_out = th.stack(mac_out, dim=1)
         
         # Pick Q-Values for the COUNTERFACTUAL actions (attacker-perturbed actions)
         # This is the key: different attackers → different victim selections → different counterfactual actions
-        chosen_action_qvals_1 = th.gather(mac_out_1[:, :-1], dim=3, index=actions_counterfactual).squeeze(3)
-        chosen_action_qvals_2 = th.gather(mac_out_2[:, :-1], dim=3, index=actions_counterfactual).squeeze(3)
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions_counterfactual).squeeze(3)
         
         # === Step 2: Calculate TD targets (using target network with clean actions) ===
         # Target network uses ORIGINAL actions (not counterfactual)
@@ -865,8 +594,7 @@ class MACOLearner:
             target_mac_out = th.stack(target_mac_out, dim=1)
 
             # Double Q-learning: use current network for action selection
-            mac_out_combined = th.min(mac_out_1, mac_out_2)
-            mac_out_detach = mac_out_combined.clone().detach()
+            mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
@@ -886,24 +614,17 @@ class MACOLearner:
 
         # === Step 3: Apply mixer and compute TD error ===
         with th.no_grad():
-            chosen_action_qvals_1 = self.mixer(chosen_action_qvals_1, batch["state"][:, :-1])
-            chosen_action_qvals_2 = self.mixer(chosen_action_qvals_2, batch["state"][:, :-1])
+            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
 
-        # Calculate TD error for both MACs
-        td_error_1 = (chosen_action_qvals_1 - targets.detach())
-        td_error2_1 = 0.5 * td_error_1.pow(2)
-        
-        td_error_2 = (chosen_action_qvals_2 - targets.detach())
-        td_error2_2 = 0.5 * td_error_2.pow(2)
+        # Calculate TD error
+        td_error = (chosen_action_qvals - targets.detach())
+        td_error2 = 0.5 * td_error.pow(2)
 
-        mask_expanded = mask.expand_as(td_error2_1)
-        masked_td_error_1 = td_error2_1 * mask_expanded
-        masked_td_error_2 = td_error2_2 * mask_expanded
+        mask_expanded = mask.expand_as(td_error2)
+        masked_td_error = td_error2 * mask_expanded
 
-        # Average TD errors from both MACs
-        mean_td_error_1 = masked_td_error_1.sum() / (mask_expanded.sum() + 1e-8)
-        mean_td_error_2 = masked_td_error_2.sum() / (mask_expanded.sum() + 1e-8)
-        mean_td_error = (mean_td_error_1 + mean_td_error_2) / 2.0
+        # Mean TD error
+        mean_td_error = masked_td_error.sum() / (mask_expanded.sum() + 1e-8)
         
         # Safety check: if TD error is unreasonably large, cap it
         if mean_td_error.item() > 1e6:
@@ -912,17 +633,6 @@ class MACOLearner:
         # Return TD error (higher = better for attacker, as it means more disruption)
         return mean_td_error
     
-    # ========== REMOVED: calculate_attacker_efficiency ==========
-    # "原来的3个目标去除掉efficiency，因为实际会导致完全不攻击。
-    # （一点预算都不用，就是最高效的，不会被pareto支配）"
-    #
-    # Efficiency leads to no attacks at all (zero budget = maximum efficiency),
-    # which defeats the purpose of adversarial training.
-    #
-    # Attacker Fitness (2 objectives only):
-    # 1. Quality: Negative defender reward (calculate_attacker_quality)
-    # 2. Novelty: Attack pattern diversity (calculate_attacker_behavioral_novelty)
-    # =================================================================
 
     # ========== Attacker Novelty Calculation (REFACTORED: Batch KL-Divergence) ==========
     def calculate_all_attacker_novelties(self, batch, population_attackers):

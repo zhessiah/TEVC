@@ -9,6 +9,7 @@ from .lica_controller import LICAMAC
 from .dop_controller import DOPMAC
 from .maddpg_controller import MADDPGMAC
 from .attack_controller import AttackMAC
+from .maco_agent_controller import MACOMAC
 
 REGISTRY["basic_mac"] = BasicMAC
 REGISTRY["n_mac"] = NMAC
@@ -19,3 +20,4 @@ REGISTRY["lica_mac"] = LICAMAC
 REGISTRY["dop_mac"] = DOPMAC
 REGISTRY["maddpg_mac"] = MADDPGMAC
 REGISTRY["attack_mac"] = AttackMAC
+REGISTRY["maco_mac"] = MACOMAC

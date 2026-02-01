@@ -27,10 +27,78 @@ def get_agent_own_state_size(env_args):
     return  4 + sc_env.shield_bits_ally + sc_env.unit_type_bits
 
 
+def get_attacker_num_clusters(map_name, n_agents):
+    """
+    Compute number of K-Means clusters for attacker QD selection based on map heterogeneity.
+    
+    Design Principle:
+    - Heterogeneous maps: Cluster by unit type (e.g., MMM has 3 types → 3 clusters)
+    - Homogeneous maps: Cluster by subgroups (e.g., 8m has 8 marines → 4 clusters)
+    
+    Args:
+        map_name: StarCraft II map name
+        n_agents: Number of ally agents
+    
+    Returns:
+        num_clusters: Number of clusters for diversity-driven evolution
+    
+    Rationale:
+        In Quality-Diversity (QD) evolution, attackers should specialize against
+        different victim types. Heterogeneous maps require type-specific strategies,
+        while homogeneous maps benefit from spatial/tactical diversification.
+    """
+    # Map-specific cluster configurations
+    # Format: {map_name: (num_clusters, reason)}
+    cluster_config = {
+        # Heterogeneous Maps (by unit type)
+        "MMM": 3,           # 1 Medivac + 2 Marauders + 7 Marines → 3 unit types
+        "MMM2": 3,          # Same as MMM
+        "1c3s5z": 3,        # 1 Colossus + 3 Stalkers + 5 Zealots → 3 unit types
+        "2c_vs_64zg": 2,    # 2 Colossi → 2 clusters (small map)
+        "bane_vs_bane": 2,  # Banelings + Zerglings → 2 unit types
+        "2s3z": 2,          # 2 Stalkers + 3 Zealots → 2 unit types
+        "3s5z": 2,          # 3 Stalkers + 5 Zealots → 2 unit types
+        "3s5z_vs_3s6z": 2,  # Same unit types
+        "5m_vs_6m": 5,      # 5 Marines → diversify by position
+        "10m_vs_11m": 5,    # 10 Marines → 5 clusters (spatial diversity)
+        "25m": 5,           # 25 Marines → 5 clusters (avoid over-fragmentation)
+        "corridor": 6,      # 6 Zealots → 6 clusters (positional tactics)
+        
+        # Symmetric Maps (by agent position/role)
+        "3s_vs_3z": 3,      # 3 Stalkers vs 3 Zealots → 3 positional clusters
+        "3s_vs_4z": 3,      # 3 Stalkers vs 4 Zealots → 3 positional clusters
+        "3s_vs_5z": 3,      # 3 Stalkers vs 5 Zealots → 3 positional clusters
+        "2s_vs_1sc": 2,     # 2 Stalkers vs 1 Spine Crawler → 2 clusters
+        
+        # Homogeneous Maps (by subgroup diversity)
+        "8m": 4,            # 8 Marines → 4 clusters (pairs or spatial groups)
+        "3m": 3,            # 3 Marines → 3 clusters (individual specialization)
+        "2m_vs_1z": 2,      # 2 Marines → 2 clusters
+        "27m_vs_30m": 6,    # 27 Marines → 6 clusters (balance diversity & efficiency)
+        "6h_vs_8z": 3,      # 6 Hydralisks → 3 clusters
+        "2s_vs_64zg": 2,    # 2 Stalkers → 2 clusters
+    }
+    
+    # Return configured value or default heuristic
+    if map_name in cluster_config:
+        return cluster_config[map_name]
+    
+    # Default heuristic for unknown maps:
+    # - Small maps (≤5 agents): n_agents clusters (fine-grained)
+    # - Medium maps (6-15 agents): n_agents // 2 clusters (balance)
+    # - Large maps (>15 agents): min(n_agents // 3, 8) clusters (avoid over-fragmentation)
+    if n_agents <= 5:
+        return n_agents
+    elif n_agents <= 15:
+        return max(n_agents // 2, 2)  # At least 2 clusters
+    else:
+        return min(n_agents // 3, 8)  # Cap at 8 clusters for large maps
+
+
 def rl_to_evo(rl_genome, evo_genome):
     """
     Transfer parameters from RL Genome to Evolution Genome with HARD REPLACEMENT.
-    Both Genomes contain two MACs (mac1 and mac2).
+    Genome contains a single MAC.
     Direction: RL → Evolution (完全替换，不保留原参数)
     
     NOTE: Mixer is NOT transferred (it's not part of Genome anymore).
@@ -38,12 +106,8 @@ def rl_to_evo(rl_genome, evo_genome):
     For batch replacement, use rl_to_evo_excluding_pareto() instead.
     """
     # HARD REPLACEMENT: Direct parameter copy (no EMA)
-    # Transfer mac1 parameters
-    for target_param, param in zip(evo_genome.mac1.agent.parameters(), rl_genome.mac1.agent.parameters()):
-        target_param.data.copy_(param.data)  # Complete replacement
-    
-    # Transfer mac2 parameters
-    for target_param, param in zip(evo_genome.mac2.agent.parameters(), rl_genome.mac2.agent.parameters()):
+    # Transfer mac parameters
+    for target_param, param in zip(evo_genome.mac.agent.parameters(), rl_genome.mac.agent.parameters()):
         target_param.data.copy_(param.data)  # Complete replacement
 
 
@@ -69,12 +133,8 @@ def rl_to_evo_excluding_elites(rl_genome, population, best_agents):
         evo_genome = population[i]
         
         # HARD REPLACEMENT: Directly copy RL parameters (no EMA, no blending)
-        # Transfer mac1 parameters
-        for target_param, param in zip(evo_genome.mac1.agent.parameters(), rl_genome.mac1.agent.parameters()):
-            target_param.data.copy_(param.data)  # Complete replacement
-        
-        # Transfer mac2 parameters
-        for target_param, param in zip(evo_genome.mac2.agent.parameters(), rl_genome.mac2.agent.parameters()):
+        # Transfer mac parameters
+        for target_param, param in zip(evo_genome.mac.agent.parameters(), rl_genome.mac.agent.parameters()):
             target_param.data.copy_(param.data)  # Complete replacement
 
 
@@ -140,6 +200,14 @@ def run(_run, _config, _log):
 
     # sacred is on by default
     logger.setup_sacred(_run)
+
+    # Setup behavior vector logging (simple text file)
+    if args.use_tensorboard and args.EA and args.adversarial_training:
+        behavior_log_path = os.path.join(args.model_path, "elite_behaviors.jsonl")
+        args.behavior_log_path = behavior_log_path
+        logger.console_logger.info(f"Attacker behavior vectors will be logged to: {behavior_log_path}")
+    else:
+        args.behavior_log_path = None
 
     # Run and train
     run_sequential(args=args, logger=logger)
@@ -218,7 +286,7 @@ def run_sequential(args, logger):
 
     # Setup populations of multiagent controller here
     if args.EA:
-        # Create main Genome (contains two MACs for double Q-learning)
+        # Create main Genome (contains a single MAC, simplified from double Q-learning)
         genome = Genome(args, buffer, groups)
         
         # Create population of Genomes
@@ -345,7 +413,7 @@ def run_sequential(args, logger):
                 for i in best_agents:
                     if args.adversarial_training:
                         for j in best_attackers:
-                            population[i].mac1.set_attacker(population_attackers[j])
+                            population[i].mac.set_attacker(population_attackers[j])
                             episode_batch = runner.run(population[i], test_mode=False)
                             buffer.insert_episode_batch(episode_batch)
                     else:
@@ -360,7 +428,7 @@ def run_sequential(args, logger):
             if args.EA:
                 if args.adversarial_training:
                     for j in best_attackers:
-                        genome.mac1.set_attacker(population_attackers[j])
+                        genome.mac.set_attacker(population_attackers[j])
                         episode_batch = runner.run(genome, test_mode=False)
                 else:
                     episode_batch = runner.run(genome, test_mode=False)
@@ -460,7 +528,7 @@ def run_sequential(args, logger):
                 # === Step 2: Fitness Evaluation (Simplified to 2 Objectives) ===
                 # MACO V6: Defenders have only 2 objectives
                 # 1. Optimality: TD Error (environment fitting)
-                # 2. Robustness: Fault Isolation Ratio (Byzantine tolerance)
+                # 2. Robustness: Adversarial Q-Value Expectation (maximize Q under attack)
                 fitness = [[] for _ in range(args.pop_size)]
                 
                 for i in range(args.pop_size):
@@ -468,13 +536,47 @@ def run_sequential(args, logger):
                     env_precise_fitness = learner.calculate_TD_error(episode_batch, i)
                     fitness[i].append(-env_precise_fitness.cpu().numpy())
                     
-                    # Objective 2: Robustness (Fault Isolation Ratio)
-                    robust_smooth_fitness = learner.calculate_adversarial_loss(episode_batch, i)
-                    fitness[i].append(-robust_smooth_fitness.cpu().numpy())
+                    # Objective 2: Robustness (Adversarial Q-Value - higher is better)
+                    # Pass population_attackers for worst-case evaluation
+                    robust_smooth_fitness = learner.calculate_adversarial_loss(
+                        episode_batch, i, population_attackers=population_attackers
+                    )
+                    # NOTE: No negation! Higher adversarial Q-value = better robustness
+                    fitness[i].append(robust_smooth_fitness.cpu().numpy())
                 
+                # === Step 2.5: Calculate Agent Contribution (Importance) based on Attacker Focus ===
+                # User's Logic: Agents attacked more frequently are High Contribution
+                if "victim_id" in episode_batch.scheme:
+                    # victim_ids contains 0..n_agents-1 (attack specific) and n_agents (no attack)
+                    n_agents = args.n_agents
+                    # Get victim IDs from batch (excluding last timestep for shape matching)
+                    victim_ids = episode_batch["victim_id"][:, :-1] # [bs, seq_len, 1]
+                    flat_victims = victim_ids.reshape(-1)
+                    
+                    # Count attacks for each agent (bin length = n_agents + 1 to include 'no-attack')
+                    # We only care about 0..n_agents-1
+                    counts = th.bincount(flat_victims.long(), minlength=n_agents + 1)[:n_agents]
+                    
+                    # Log raw counts for inspection
+
+                    total_attacks = counts.sum()
+                    
+                    if total_attacks > 0:
+                        agent_importance = (counts.float() / total_attacks).cpu().numpy()
+                    else:
+                        # Fallback: Uniform importance if no attacks recorded
+                        agent_importance = np.ones(n_agents) / n_agents
+                        
+                    # Log importance for debugging/analysis
+                    if args.use_tensorboard and episode % 100 == 0:
+                        for a_i in range(n_agents):
+                            logger.log_stat(f"evo_agent_{a_i}_importance", agent_importance[a_i], runner.t_env)
+                else:
+                    agent_importance = None
+
                 # === Step 3: Evolutionary Selection (进化选择阶段) ===
                 # Pass alpha_t to evolver for learning-assisted dynamic weighting
-                elite_index, replace_index = evolver.epoch(population, fitness, agent_level=True, alpha_t=alpha_t)
+                elite_index, replace_index = evolver.epoch(population, fitness, agent_level=True, alpha_t=alpha_t, agent_importance=agent_importance)
                 best_agents = elite_index
                 
                 # Log defender fitness statistics (all defenders)
@@ -535,8 +637,21 @@ def run_sequential(args, logger):
                         f"[Attacker QD Selection] Computing fitness and behavior vectors..."
                     )
                     
-                    # Get number of clusters from args (default: n_agents for victim-centric diversity)
-                    num_clusters = getattr(args, 'attacker_num_clusters', args.n_agents)
+                    # Get number of clusters: prioritize config, then map-based heuristic, finally n_agents
+                    if hasattr(args, 'attacker_num_clusters') and args.attacker_num_clusters is not None:
+                        # User explicitly set in config
+                        num_clusters = args.attacker_num_clusters
+                        logger.console_logger.info(
+                            f"[Attacker QD] Using config-specified clusters: {num_clusters}"
+                        )
+                    else:
+                        # Compute based on map heterogeneity
+                        map_name = args.env_args.get("map_name", "unknown")
+                        num_clusters = get_attacker_num_clusters(map_name, args.n_agents)
+                        logger.console_logger.info(
+                            f"[Attacker QD] Map '{map_name}': Auto-computed {num_clusters} clusters "
+                            f"(n_agents={args.n_agents})"
+                        )
                     
                     # Call QD selection: K-Means clustering + elite selection
                     with th.no_grad():
@@ -553,6 +668,38 @@ def run_sequential(args, logger):
                         f"[Attacker QD Selection] Selected {len(attacker_elite_index)} elites from "
                         f"{num_clusters} clusters. Elites: {attacker_elite_index[:5]}"
                     )
+                    
+                    # === NEW: Append Elite Behavior Vectors to Text File ===
+                    if args.behavior_log_path is not None:
+                        import json
+                        
+                        behavior_vectors = fitness_dict['behavior_vectors']
+                        elite_behavior_vectors = behavior_vectors[attacker_elite_index]
+                        cluster_labels = fitness_dict['cluster_labels']
+                        elite_cluster_labels = cluster_labels[attacker_elite_index]
+                        td_errors = fitness_dict['td_errors']
+                        elite_td_errors = td_errors[attacker_elite_index]
+                        
+                        # Prepare data record (one line per timestep)
+                        record = {
+                            'timestep': int(runner.t_env),
+                            'episode': int(episode),
+                            'n_agents': int(args.n_agents),
+                            'num_clusters': int(num_clusters),
+                            'n_elites': len(attacker_elite_index),
+                            'elite_indices': [int(x) for x in attacker_elite_index],
+                            'elite_td_errors': [float(x) for x in elite_td_errors],
+                            'elite_cluster_labels': [int(x) for x in elite_cluster_labels],
+                            'elite_behavior_vectors': [[float(y) for y in x] for x in elite_behavior_vectors],
+                        }
+                        
+                        # Append to file (create if not exists)
+                        with open(args.behavior_log_path, 'a') as f:
+                            f.write(json.dumps(record) + '\n')
+                        
+                        logger.console_logger.info(
+                            f"[Behavior Logging] Appended elite behaviors to {args.behavior_log_path}"
+                        )
                     
                     # === Step 2: Memetic SGD for Elite Attackers (NEW: Budget-Modulated Advantage) ===
                     # Uses new attack advantage function from MACO V6
@@ -600,22 +747,24 @@ def run_sequential(args, logger):
                         
                         # Execute genetic operations for each non-elite attacker
                         for replace_idx in attacker_replace_index:
-                            # Tournament selection: pick 2 random elites as parents
+                            # Tournament selection: pick 1 random elite as parent (PBT style)
                             parent1_idx = np.random.choice(attacker_elite_index)
-                            parent2_idx = np.random.choice(attacker_elite_index)
+                            # parent2_idx = np.random.choice(attacker_elite_index)  # No longer needed for Mutation-only
                             
                             offspring = population_attackers[replace_idx]
                             parent1 = population_attackers[parent1_idx]
-                            parent2 = population_attackers[parent2_idx]
+                            # parent2 = population_attackers[parent2_idx]
                             
                             # Copy parent1's parameters to offspring (optimized)
                             offspring.load_state_dict(parent1.state_dict())
                             
-                            # Crossover: blend offspring (copy of parent1) with parent2
-                            attacker_evolver.crossover_inplace(offspring, parent2)
+                            # Crossover: DISABLED (Permutation Problem for NN)
+                            # We rely on Mutation (Exploration) + Memetic SGD (Exploitation)
+                            # attacker_evolver.crossover_inplace(offspring, parent2)
                             
-                            # Mutation: add Gaussian noise to parameters
-                            attacker_evolver.mutate_inplace(offspring, agent_level=True)
+                            # Mutation: add Gaussian noise to parameters (parameter-level for MLPAttacker)
+                            # Consider increasing mutation strength slightly if diversity drops
+                            attacker_evolver.mutate_inplace(offspring, agent_level=False)
                         
                         logger.console_logger.info(
                             f"[Attacker Genetic Ops] Completed evolution for {len(attacker_replace_index)} attackers. "
@@ -680,7 +829,7 @@ def run_sequential(args, logger):
                 if len(best_attackers) > 0:
                     logger.console_logger.info("[测试2/2] 评估对抗鲁棒性 (精英攻击者)...")
                     elite_attacker_id = best_attackers[0]
-                    genome.mac1.set_attacker(population_attackers[elite_attacker_id])
+                    genome.mac.set_attacker(population_attackers[elite_attacker_id])
                     
                     for _ in range(n_test_runs):
                         runner.run_under_attack(genome, test_mode=True)  # 使用 run_under_attack() -> test_under_attack_*

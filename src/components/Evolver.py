@@ -4,158 +4,201 @@ import fastrand
 import torch
 from components.episode_buffer import EpisodeBatch
 from controllers import REGISTRY as mac_REGISTRY
-from itertools import chain
 
 def is_lnorm_key(key):
     return key.startswith('lnorm')
 
 class Genome:
     """
-    Genome class containing two MAC objects for Double Q-learning style estimation.
-    Forward returns min(q1, q2) to prevent Q-value overestimation.
+    Genome class containing a single MAC object.
+    Simplified from Double Q-learning architecture as double-Q has minimal impact on results.
     """
     def __init__(self, args, buffer, groups):
         self.n_agents = args.n_agents
         self.args = args
         
-        # Create two separate MACs with the same configuration
-        self.mac1 = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
-        self.mac2 = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+        # Create a single MAC
+        self.mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
         
-        # Use mac1's action selector as the shared selector
-        self.action_selector = self.mac1.action_selector
+        # Use mac's action selector
+        self.action_selector = self.mac.action_selector
         self.agent_output_type = args.agent_output_type
         self.save_probs = getattr(self.args, 'save_probs', False)
     
     def train(self):
-        """Set both agents to training mode."""
-        self.mac1.agent.train()
-        self.mac2.agent.train()
+        """Set agent to training mode."""
+        self.mac.agent.train()
+        
     def eval(self):
-        """Set both agents to evaluation mode."""
-        self.mac1.agent.eval()
-        self.mac2.agent.eval()
+        """Set agent to evaluation mode."""
+        self.mac.agent.eval()
     
     def init_hidden(self, batch_size):
-        """Initialize hidden states for both MACs."""
-        self.mac1.init_hidden(batch_size)
-        self.mac2.init_hidden(batch_size)
+        """Initialize hidden states for MAC."""
+        self.mac.init_hidden(batch_size)
     
     def forward(self, ep_batch, t, test_mode=False):
         """
-        Forward pass through both MACs and return the minimum Q-values.
-        This prevents Q-value overestimation (Double Q-learning style).
+        Forward pass through MAC and return Q-values.
+        Simplified from Double Q-learning as it has minimal impact on results.
         """
-        q1 = self.mac1.forward(ep_batch, t, test_mode=test_mode)
-        q2 = self.mac2.forward(ep_batch, t, test_mode=test_mode)
-        # Return minimum to prevent overestimation
-        return torch.min(q1, q2)
+        return self.mac.forward(ep_batch, t, test_mode=test_mode)
     
     def select_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
-        """Select actions using the minimum Q-values from both MACs."""
+        """Select actions using Q-values from MAC."""
         avail_actions = ep_batch["avail_actions"][:, t_ep]
         agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)
         chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
         return chosen_actions
     
     def select_byzantine_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
-        """Select byzantine actions using the minimum Q-values from both MACs."""
-        # avail_actions = ep_batch["avail_actions"][:, t_ep]
-        # agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)        
-        ori_actions, worst_actions, which_agent_to_attack = self.mac1.select_actions(ep_batch, t_ep, t_env, bs, test_mode=test_mode)
+        """Select byzantine actions using Q-values from MAC."""
+        ori_actions, worst_actions, which_agent_to_attack = self.mac.select_actions(ep_batch, t_ep, t_env, bs, test_mode=test_mode)
         return ori_actions, worst_actions, which_agent_to_attack
     
     def parameters(self):
-        """Return parameters from both MACs."""
-        return chain(self.mac1.parameters(), self.mac2.parameters())
+        """Return parameters from MAC."""
+        return self.mac.parameters()
 
     def load_state(self, other_mac):
-        """Load state from another Genome."""
-        if hasattr(other_mac, 'mac1') and hasattr(other_mac, 'mac2'):
+        """Load state from another Genome or MAC."""
+        if hasattr(other_mac, 'mac'):
             # Loading from another Genome
-            self.mac1.load_state(other_mac.mac1)
-            self.mac2.load_state(other_mac.mac2)
+            self.mac.load_state(other_mac.mac)
         else:
-            # Loading from a single MAC (copy to both)
-            self.mac1.load_state(other_mac)
-            self.mac2.load_state(other_mac)
+            # Loading from a single MAC
+            self.mac.load_state(other_mac)
 
     def cuda(self):
-        """Move both MACs to CUDA."""
-        self.mac1.cuda()
-        self.mac2.cuda()
+        """Move MAC to CUDA."""
+        self.mac.cuda()
     
     def save_models(self, path):
-        """Save both MAC models."""
-        torch.save(self.mac1.agent.state_dict(), "{}/agent1.th".format(path))
-        torch.save(self.mac2.agent.state_dict(), "{}/agent2.th".format(path))
+        """Save MAC model."""
+        torch.save(self.mac.agent.state_dict(), "{}/agent.th".format(path))
     
     def load_models(self, path):
-        """Load both MAC models."""
-        self.mac1.agent.load_state_dict(
-            torch.load("{}/agent1.th".format(path), map_location=lambda storage, loc: storage)
-        )
-        self.mac2.agent.load_state_dict(
-            torch.load("{}/agent2.th".format(path), map_location=lambda storage, loc: storage)
+        """Load MAC model."""
+        self.mac.agent.load_state_dict(
+            torch.load("{}/agent.th".format(path), map_location=lambda storage, loc: storage)
         )
 
     def _build_agents(self, input_shape):
-        """Build agents for both MACs."""
-        self.mac1._build_agents(input_shape)
-        self.mac2._build_agents(input_shape)
+        """Build agents for MAC."""
+        self.mac._build_agents(input_shape)
 
     def _build_inputs(self, batch, t):
         """Build inputs for agents (delegates to MAC's method)."""
-        return self.mac1._build_inputs(batch, t)
+        return self.mac._build_inputs(batch, t)
 
     def _get_input_shape(self, scheme):
         """Get input shape for agents (delegates to MAC's method)."""
-        return self.mac1._get_input_shape(scheme)
-    def eval(self):
-        """Set both agents to evaluation mode."""
-        self.mac1.agent.eval()
-        self.mac2.agent.eval()
+        return self.mac._get_input_shape(scheme)
+    
+    def has_agent_level_support(self):
+        """
+        Check if MAC supports agent-level operations (MACO agent-level decomposition).
+        
+        Returns:
+            bool: True if MAC has agent_W list (MACOAgentController), False otherwise
+        """
+        return hasattr(self.mac, 'agent_W') and isinstance(self.mac.agent_W, list)
+    
+    def get_agent_W(self, agent_index):
+        """
+        Get the weight head for a specific agent.
+        
+        Args:
+            agent_index: Index of the agent (0 ~ n_agents-1)
+            
+        Returns:
+            agent_W: Weight head network for the specified agent
+            
+        Raises:
+            ValueError: If MAC does not support agent-level operations
+        """
+        if self.has_agent_level_support():
+            return self.mac.agent_W[agent_index]
+        else:
+            raise ValueError("Current MAC does not support agent-level operations. "
+                           "Use 'maco_agent_mac' controller for agent-level evolution.")
+    
+    def get_agent_SR(self):
+        """
+        Get the shared state representation network.
+        
+        Returns:
+            agent_SR: Shared state representation network
+            
+        Raises:
+            ValueError: If MAC does not support agent-level operations
+        """
+        if self.has_agent_level_support():
+            return self.mac.agent_SR
+        else:
+            raise ValueError("Current MAC does not support agent-level operations. "
+                           "Use 'maco_agent_mac' controller for agent-level evolution.")
     
     def state_dict(self):
         """
-        Return combined state dict of both MACs for evolutionary operations.
-        Returns a flat dictionary where keys are prefixed with 'mac1.' or 'mac2.'
+        Return state dict of MAC for evolutionary operations.
+        Returns a flat dictionary of parameter tensors.
         
         Important: The returned tensors share storage with the actual parameters,
         so modifications to the returned tensors will affect the model parameters.
         This is required for the mutate_inplace() operation in NN_Evolver.
+        
+        Supports two MAC types:
+        1. BasicMAC-style: has self.mac.agent (single shared agent)
+        2. MACOAgentMAC-style: has self.mac.agent_SR + self.mac.agent_W (decomposed)
         """
         state = {}
-        # Add mac1 parameters with prefix - use named_parameters to get actual parameter tensors
-        for name, param in self.mac1.agent.named_parameters():
-            state[f'mac1.{name}'] = param.data
         
-        # Add mac2 parameters with prefix
-        for name, param in self.mac2.agent.named_parameters():
-            state[f'mac2.{name}'] = param.data
+        # Check which MAC type we have
+        if hasattr(self.mac, 'agent_SR') and hasattr(self.mac, 'agent_W'):
+            # MACOAgentMAC: decomposed architecture
+            # Add agent_SR parameters
+            for name, param in self.mac.agent_SR.named_parameters():
+                state[f"agent_SR.{name}"] = param.data
+            
+            # Add agent_W parameters for each agent
+            for i, agent_w in enumerate(self.mac.agent_W):
+                for name, param in agent_w.named_parameters():
+                    state[f"agent_W.{i}.{name}"] = param.data
+        else:
+            # BasicMAC: single shared agent
+            for name, param in self.mac.agent.named_parameters():
+                state[name] = param.data
         
         return state
     
     def load_state_dict(self, state_dict):
         """
-        Load state dict into both MACs.
-        Expects keys prefixed with 'mac1.' or 'mac2.'
+        Load state dict into MAC.
+        
+        Supports both BasicMAC and MACOAgentMAC architectures.
         """
-        mac1_state = {}
-        mac2_state = {}
-        
-        for key, value in state_dict.items():
-            if key.startswith('mac1.'):
-                # Remove 'mac1.' prefix
-                mac1_state[key[5:]] = value
-            elif key.startswith('mac2.'):
-                # Remove 'mac2.' prefix
-                mac2_state[key[5:]] = value
-        
-        if mac1_state:
-            self.mac1.agent.load_state_dict(mac1_state)
-        if mac2_state:
-            self.mac2.agent.load_state_dict(mac2_state)
+        if hasattr(self.mac, 'agent_SR') and hasattr(self.mac, 'agent_W'):
+            # MACOAgentMAC: need to split state_dict
+            sr_state = {}
+            w_states = [{}for _ in range(len(self.mac.agent_W))]
+            
+            for key, value in state_dict.items():
+                if key.startswith("agent_SR."):
+                    sr_state[key.replace("agent_SR.", "")] = value
+                elif key.startswith("agent_W."):
+                    # Parse agent_W.{i}.{param_name}
+                    parts = key.split(".", 2)
+                    agent_idx = int(parts[1])
+                    param_name = parts[2]
+                    w_states[agent_idx][param_name] = value
+            
+            self.mac.agent_SR.load_state_dict(sr_state)
+            for i, agent_w in enumerate(self.mac.agent_W):
+                agent_w.load_state_dict(w_states[i])
+        else:
+            # BasicMAC: direct load
+            self.mac.agent.load_state_dict(state_dict)
 
 class NN_Evolver:
     def __init__(self, args):
@@ -253,11 +296,30 @@ class NN_Evolver:
             i += 1
 
     def mutate_inplace(self, gene, agent_level=False):
+        """
+        Mutate a genome in-place.
+        
+        Args:
+            gene: Genome instance (defender) or MLPAttacker instance (attacker) to mutate
+            agent_level: If True, perform agent-level mutation (only on agent_W networks)
+                        Only applies to Genome with agent-level support (MACOMAC)
+        
+        Note: mutation_prob is already checked in epoch(), so we don't check it again here
+        """
+        # Check if gene supports agent-level operations (only Genome has this method)
+        if agent_level and hasattr(gene, 'has_agent_level_support') and gene.has_agent_level_support():
+            # Agent-level mutation: mutate each agent independently (MACOMAC defender)
+            n_agents = len(gene.mac.agent_W)
+            for agent_idx in range(n_agents):
+                mutate_agent_level(gene, agent_idx, self.args)
+            return
+        
+        # Parameter-level mutation (original implementation)
         trials = 5
 
         mut_strength = 0.1
         num_mutation_frac = 0.1
-        super_mut_strength = 10
+        super_mut_strength = 10.0
         super_mut_prob = self.prob_reset_and_sup
         reset_prob = super_mut_prob + self.prob_reset_and_sup
 
@@ -273,12 +335,8 @@ class NN_Evolver:
             # References to the variable keys
             W = model_params[key]
             if len(W.shape) == 2:  # Weights, no bias
-                if agent_level:
-                    ssne_prob = 1.0  # ssne_probabilities[i]
-                    action_prob = 1.0
-                else:
-                    ssne_prob = 1.0
-                    action_prob = ssne_probabilities[i]
+                ssne_prob = 1.0
+                action_prob = ssne_probabilities[i]
 
                 if random.random() < ssne_prob:
                     num_variables = W.shape[0]
@@ -347,43 +405,7 @@ class NN_Evolver:
         # Determine number of objectives
         n_objectives = len(individual1)
         
-        if n_objectives == 5:
-            # 5-objective case: Symmetrical weighting with Quality-Diversity
-            # Optimality side (f[0], f[1]): split w_optimality equally
-            # Robustness side (f[2], f[3], f[4]): split w_robustness equally
-            w_optimality = 1.0 - alpha_t
-            w_robustness = alpha_t
-            
-            weights = [
-                w_optimality / 2.0,  # f[0]: -TD_error (环境拟合)
-                w_optimality / 2.0,  # f[1]: confidence_Q (价值自信)
-                w_robustness / 3.0,  # f[2]: -adversarial_loss (攻击敏感度)
-                w_robustness / 3.0,  # f[3]: adversarial_confidence (鲁棒自信度)
-                w_robustness / 3.0   # f[4]: adversarial_novelty (对抗性新颖度)
-            ]
-        elif n_objectives == 4:
-            # 4-objective case: Symmetrical weighting
-            # Optimality side (f[0], f[1]): split w_optimality equally
-            # Robustness side (f[2], f[3]): split w_robustness equally
-            w_optimality = 1.0 - alpha_t
-            w_robustness = alpha_t
-            
-            weights = [
-                w_optimality / 2.0,  # f[0]: -TD_error (环境拟合)
-                w_optimality / 2.0,  # f[1]: confidence_Q (价值自信)
-                w_robustness / 2.0,  # f[2]: -adversarial_loss (攻击敏感度)
-                w_robustness / 2.0   # f[3]: adversarial_confidence (鲁棒自信度)
-            ]
-        elif n_objectives == 3:
-            # 3-objective case (backward compatibility): 
-            # f[0] = optimality (full weight)
-            # f[1], f[2] = robustness (split weight)
-            w_optimality = 1.0 - alpha_t
-            w_robustness = alpha_t
-            weights = [w_optimality, w_robustness / 2.0, w_robustness / 2.0]
-        else:
-            # Fallback: equal weights
-            weights = [1.0 / n_objectives] * n_objectives
+        weights = [1.0 / n_objectives] * n_objectives
         
         # Scale each objective by its weight
         weighted_f1 = [f * w for f, w in zip(individual1, weights)]
@@ -479,7 +501,7 @@ class NN_Evolver:
 
         return distances
 
-    def epoch(self, pop, fitness_evals, agent_level=False, alpha_t=0.0):
+    def epoch(self, pop, fitness_evals, agent_level=False, alpha_t=0.0, agent_importance=None):
         """
         One epoch of evolutionary algorithm with learning-assisted dynamic weighting.
         
@@ -488,31 +510,158 @@ class NN_Evolver:
             fitness_evals: List of fitness tuples for each individual
             agent_level: Whether to use agent-level operations
             alpha_t: Learning progress weight for adaptive multi-objective optimization
+            agent_importance: numpy array of shape (n_agents,) indicating global importance (attack frequency)
+                            If provided, Crossover prefers high-importance agents and Mutation targets low-importance ones.
         """
         # Entire epoch is handled with indices; Index rank nets by fitness evaluation (0 is the best after reversing)
-
+        
+        # Determine ranking strategy
         if self.args.Pareto:
             population = [self.fitness_split(fitness) for fitness in fitness_evals]
-
             pareto_fronts = self.non_dominated_sorting(population, alpha_t=alpha_t)
-
+            
             # Calculate crowding distance for each front
             crowding_distances = {}
             for front in pareto_fronts:
                 crowding_distances.update(self.calculate_crowding_distance(front, population))
 
-            # Selection step: select individuals from Pareto fronts, using crowding distance for tie-breaking
+            # Selection step: select individuals from Pareto fronts
             index_rank = []
             for front in pareto_fronts:
-                # sorted_front = sorted(front, key=lambda i: crowding_distances[i], reverse=True)
-                # selected.extend(sorted_front[:len(pop) // len(pareto_fronts)])  # Select individuals from each front
                 index_rank.extend(front)
-            # Elitism: Keep the best individuals (from the first front)
-            elitist_index = index_rank[:self.num_elitists]   
         else:
             index_rank = np.argsort(fitness_evals)[::-1]
-            elitist_index = index_rank[:self.num_elitists]  # Elitist indexes safeguard
+        
+        # Elitist indexes safeguard
+        elitist_index = index_rank[:self.num_elitists]
+
+        # ---------------------------------------------------------------------
+        # CASE 1: AGENT-LEVEL EVOLUTION (Strict RACE Alignment)
+        # ---------------------------------------------------------------------
+        # If agent_level is True, proper RACE implementation requires independent 
+        # evolution (Selection, Elitism, Crossover, Mutation) for each module.
+        # This allows combinatorial mixing of best modules from different parents.
+        if agent_level and hasattr(pop[0], 'has_agent_level_support') and pop[0].has_agent_level_support():
+            # Define modules to evolve: -1 (SR) + 0..n_agents-1 (Heads)
+            n_agents = len(pop[0].mac.agent_W)
+            # We evolve SR first as an independent module (proxy for "Body")
+            # Then evolve each Agent Head independently.
+            modules_to_evolve = [-1] + list(range(n_agents))
+            
+            # Use a dummy list to track "Elites" for the return value (though elites differ per module)
+            # We will use the elites from the LAST module (or SR) as the reference for "worst_index" calculation
+            # But realistically, the concept of "Elite Individual" becomes "Composite Individual".
+            final_elitists_indices = set() 
+            
+            # Calculate importance stats if available
+            avg_importance = 0.5
+            if agent_importance is not None:
+                avg_importance = np.mean(agent_importance)
+
+            for module_idx in modules_to_evolve:
+                # 1. Selection Tournament (Per Module Selection)
+                # If agent_importance is provided, adjust selection pressure?
+                # Currently we stick to Fitness-based selection for parents for Stability.
+                # But we adjust Mutation Pressure based on Importance.
+                offsprings = self.selection_tournament(index_rank, num_offsprings=len(index_rank) - self.num_elitists,
+                                                    tournament_size=3)
+                
+                # 2. Figure out unselected candidates (Per Module Logic)
+                unselects = []
+                new_elitists = [] # Track elites for THIS module to exclude them from mutation
+                
+                for i in range(self.population_size):
+                    if i not in offsprings and i not in elitist_index:
+                        unselects.append(i)
+                random.shuffle(unselects)
+                
+                # Create working copies of index lists for this module iteration
+                current_unselects = list(unselects)
+                current_offsprings = list(offsprings)
+                
+                # 3. Elitism step: Copy Module from Elites to Replacement Slots
+                for i in elitist_index:
+                    try: 
+                        replacee = current_unselects.pop(0)
+                    except: 
+                        replacee = current_offsprings.pop(0)
+                    
+                    new_elitists.append(replacee) 
+                    # RACE Logic: "self.clone(master=pop[i], replacee=pop[replacee], agent_index=agent_index)"
+                    # This only clones the specific module!
+                    clone_module(master=pop[i], replacee=pop[replacee], module_index=module_idx)
+
+                # === Compute Agent-Specific Operator Probabilities using Softmax ===
+                # Strategy: Use softmax to convert agent_importance into selection probabilities
+                # - High importance agents → High probability for CROSSOVER (exploitation)
+                # - Low importance agents → High probability for MUTATION (exploration)
+                
+                # Compute softmax probabilities for crossover selection
+                crossover_probs = None
+                mutation_probs = None
+                
+                if agent_importance is not None and module_idx >= 0:
+                    # Softmax for crossover: High importance → High probability
+                    exp_importance = np.exp(agent_importance - np.max(agent_importance))  # Numerical stability
+                    crossover_probs = exp_importance / np.sum(exp_importance)
+                    
+                    # Inverse softmax for mutation: Low importance → High probability
+                    # Use negative importance for inverse relationship
+                    exp_inv_importance = np.exp(-agent_importance + np.max(agent_importance))
+                    mutation_probs = exp_inv_importance / np.sum(exp_inv_importance)
+                
+                # 4. Crossover Loop with Probabilistic Module Selection
+                if len(current_unselects) % 2 != 0:
+                    current_unselects.append(current_unselects[fastrand.pcg32bounded(len(current_unselects))])
+                
+                for i, j in zip(current_unselects[0::2], current_unselects[1::2]):
+                    # Decide whether to apply crossover based on agent importance
+                    # If module_idx >= 0 and we have importance, use softmax probability
+                    # Otherwise use default high probability
+                    should_crossover = True
+                    if crossover_probs is not None and module_idx >= 0:
+                        # Sample from Bernoulli distribution with probability = crossover_probs[module_idx]
+                        should_crossover = random.random() < crossover_probs[module_idx]
+                    
+                    if should_crossover:
+                        off_i = random.choice(new_elitists)
+                        off_j = random.choice(current_offsprings)
+                        
+                        # Inherit Base (Component Only!) - Reset slot to parent's component
+                        clone_module(master=pop[off_i], replacee=pop[i], module_index=module_idx)
+                        clone_module(master=pop[off_j], replacee=pop[j], module_index=module_idx)
+                        
+                        # Stochastic Swap (Module Crossover)
+                        if random.random() < 0.5:
+                            clone_module(master=pop[i], replacee=pop[j], module_index=module_idx)
+                        else:
+                            clone_module(master=pop[j], replacee=pop[i], module_index=module_idx)
+
+                # 5. Mutation with Probabilistic Module Selection
+                for i in range(self.population_size):
+                    if i not in new_elitists: # Spare the new_elitists for THIS module
+                        # Decide whether to apply mutation based on agent importance
+                        # If module_idx >= 0 and we have importance, scale by mutation probability
+                        mutation_rate = self.args.mutation_prob
+                        if mutation_probs is not None and module_idx >= 0:
+                            # Scale base mutation probability by agent-specific mutation preference
+                            mutation_rate = mutation_probs[module_idx]
+                        
+                        if random.random() < mutation_rate:
+                            mutate_module(pop[i], module_index=module_idx, args=self.args)
+                
+                if module_idx == -1: # Use SR elites as the reference "Elites" for return
+                     final_elitists_indices.update(new_elitists)
+
+            # Return structure: new_elitists (indices), worst_index (indices)
+            # Since elites are mixed, we returnd indices that were protected in the SR pass
+            return list(final_elitists_indices), []
+        
+        # ---------------------------------------------------------------------
+        # CASE 2: PARAMETER-LEVEL EVOLUTION (Original/Fallback Logic)
+        # ---------------------------------------------------------------------
         worst_index = index_rank[int(-0.5 * len(index_rank)):] # replace half of the individuals
+        
         # Selection step
         offsprings = self.selection_tournament(index_rank, num_offsprings=len(index_rank) - self.num_elitists,
                                                tournament_size=3)
@@ -525,18 +674,6 @@ class NN_Evolver:
                 unselects.append(i)
         random.shuffle(unselects)
 
-        # COMPUTE RL_SELECTION RATE
-        # if self.rl_policy is not None:  # RL Transfer happened
-        #     self.selection_stats['total'] += 1.0
-
-        #     if self.rl_policy in elitist_index:
-        #         self.selection_stats['elite'] += 1.0
-        #     elif self.rl_policy in offsprings:
-        #         self.selection_stats['selected'] += 1.0
-        #     elif self.rl_policy in unselects:
-        #         self.selection_stats['discarded'] += 1.0
-        #     self.rl_policy = None
-
         # Elitism step, assigning elite candidates to some unselects
         for i in elitist_index:
             try:
@@ -547,7 +684,6 @@ class NN_Evolver:
             self.clone(master=pop[i], replace=pop[replacee])
 
         # Crossover between elite and offsprings for the unselected genes with 100 percent probability
-
         if len(unselects) % 2 != 0:  # Number of unselects left should be even
             unselects.append(unselects[fastrand.pcg32bounded(len(unselects))])
         for i, j in zip(unselects[0::2], unselects[1::2]):
@@ -556,22 +692,16 @@ class NN_Evolver:
             self.clone(master=pop[off_i], replace=pop[i])
             self.clone(master=pop[off_j], replace=pop[j])
 
-            if agent_level:
-                if random.random() < 0.5:
-                    self.clone(master=pop[i], replace=pop[j])
-                else:
-                    self.clone(master=pop[j], replace=pop[i])
-            else:
-                self.crossover_inplace(pop[i], pop[j])
+            # Standard Parameter Crossover (Deprecated for Agent-Level but kept for basic models)
+            self.crossover_inplace(pop[i], pop[j])
 
         # Mutate all genes in the population except the new elitists
         for i in range(self.population_size):
             if i not in new_elitists:  # Spare the new elitists
                 if random.random() < self.args.mutation_prob:
-                    self.mutate_inplace(pop[i], agent_level=agent_level)
+                    self.mutate_inplace(pop[i], agent_level=False)
 
         # Recalculate worst_index to exclude positions now occupied by elites
-        # worst_index should contain the actual worst performers AFTER elite copying
         worst_index = [idx for idx in worst_index if idx not in new_elitists]
         return new_elitists, worst_index
 
@@ -581,3 +711,233 @@ def unsqueeze(array, axis=1):
         return np.reshape(array, (1, len(array)))
     elif axis == 1:
         return np.reshape(array, (len(array), 1))
+
+
+# ============================================================================
+# Agent-Level Evolution Operators (MACO Agent-Level)
+# ============================================================================
+
+def crossover_agent_level(genome1, genome2, agent_index):
+    """
+    Perform agent-level crossover between two genomes.
+    Only modifies the specified agent's weight head (W network).
+    
+    This implements row-level crossover strategy for MACO:
+    - Swap entire rows of weight matrices (preserving neuron integrity)
+    - Swap corresponding bias elements
+    - Leave shared SR network untouched
+    
+    Args:
+        genome1, genome2: Two Genome instances with MACO agent-level MACs
+        agent_index: Index of the agent to crossover (0 ~ n_agents-1)
+    
+    Raises:
+        ValueError: If genomes do not support agent-level operations
+    """
+    if not genome1.has_agent_level_support():
+        raise ValueError("Genome does not support agent-level operations. "
+                       "Use 'maco_agent_mac' controller for agent-level evolution.")
+    
+    # Get weight heads for the specified agent
+    agent_W1 = genome1.get_agent_W(agent_index)
+    agent_W2 = genome2.get_agent_W(agent_index)
+    
+    # Collect bias parameters first (for matching with weight matrices)
+    b_1, b_2 = None, None
+    for param1, param2 in zip(agent_W1.parameters(), agent_W2.parameters()):
+        W1 = param1.data
+        W2 = param2.data
+        if len(W1.shape) == 1:  # Bias vector
+            b_1 = W1
+            b_2 = W2
+    
+    # Crossover weight matrices (row-level swapping)
+    for param1, param2 in zip(agent_W1.parameters(), agent_W2.parameters()):
+        W1 = param1.data
+        W2 = param2.data
+        
+        if len(W1.shape) == 2:  # Weight matrix
+            num_variables = W1.shape[0]  # Number of output neurons
+            num_cross_overs = fastrand.pcg32bounded(num_variables * 2)
+            
+            for _ in range(num_cross_overs):
+                receiver_choice = random.random()
+                ind_cr = fastrand.pcg32bounded(W1.shape[0])  # Random row index
+                
+                if receiver_choice < 0.5:
+                    # Swap row from W2 to W1
+                    W1[ind_cr, :] = W2[ind_cr, :]
+                    if b_1 is not None and b_2 is not None:
+                        b_1[ind_cr] = b_2[ind_cr]
+                else:
+                    # Swap row from W1 to W2
+                    W2[ind_cr, :] = W1[ind_cr, :]
+                    if b_2 is not None and b_1 is not None:
+                        b_2[ind_cr] = b_1[ind_cr]
+
+
+def mutate_agent_level(genome, agent_index, args):
+    """
+    Perform agent-level mutation on a genome.
+    Only modifies the specified agent's weight head (W network).
+    
+    Mutation types:
+    - Super mutation: Large gaussian noise (strength × 10)
+    - Reset: Reinitialize weights to random values
+    - Normal mutation: Small gaussian noise
+    
+    Args:
+        genome: Genome instance with MACO agent-level MAC
+        agent_index: Index of the agent to mutate (0 ~ n_agents-1)
+        args: Arguments containing mutation parameters:
+            - mut_strength: Normal mutation strength (default: 0.1)
+            - super_mut_strength: Super mutation strength (default: 10.0)
+            - super_mut_prob: Probability of super mutation (default: 0.05)
+            - reset_prob: Probability of reset (default: 0.1)
+            - mut_frac: Fraction of weights to mutate (default: 0.1)
+    
+    Raises:
+        ValueError: If genome does not support agent-level operations
+    """
+    if not genome.has_agent_level_support():
+        raise ValueError("Genome does not support agent-level operations. "
+                       "Use 'maco_agent_mac' controller for agent-level evolution.")
+    
+    agent_W = genome.get_agent_W(agent_index)
+    
+    # Get mutation parameters (aligned with parameter-level mutation in mutate_inplace)
+    mut_strength = 0.1
+    super_mut_strength = 10.0
+    # Use prob_reset_and_sup from args (same as parameter-level mutation)
+    prob_reset_and_sup = getattr(args, 'prob_reset_and_sup', 0.05)
+    super_mut_prob = prob_reset_and_sup
+    reset_prob = super_mut_prob + prob_reset_and_sup  # Cumulative probability
+    mut_frac = getattr(args, 'frac', 0.1)
+    
+    state_dict = agent_W.state_dict()
+    
+    for key in state_dict:
+        # Skip layer norm parameters
+        if is_lnorm_key(key):
+            continue
+        
+        W = state_dict[key]
+        
+        if len(W.shape) == 2:  # Weight matrix
+            num_variables = W.shape[0]
+            
+            # Agent-level mutation: mutate ALL rows (aligned with RACE action_prob=1.0)
+            for row_idx in range(num_variables):
+                # Select fraction of weights to mutate
+                index_list = random.sample(range(W.shape[1]), int(W.shape[1] * mut_frac))
+                
+                random_num = random.random()
+                
+                if random_num < super_mut_prob:
+                    # Super mutation: large gaussian noise
+                    for ind in index_list:
+                        W[row_idx, ind] += random.gauss(0, super_mut_strength * W[row_idx, ind])
+                elif random_num < reset_prob:
+                    # Reset: reinitialize to random values
+                    for ind in index_list:
+                        W[row_idx, ind] = random.gauss(0, 1)
+                else:
+                    # Normal mutation: small gaussian noise
+                    for ind in index_list:
+                        W[row_idx, ind] += random.gauss(0, mut_strength * W[row_idx, ind])
+                
+                # Regularization hard limit (use np.clip as in RACE)
+                W[row_idx, :] = torch.from_numpy(np.clip(W[row_idx, :].cpu().numpy(), a_min=-1000000, a_max=1000000)).to(W.device)
+
+
+def clone_agent_level(master, replacee, agent_index):
+    """
+    Clone a specific agent from master to replacee.
+    Only copies the specified agent's weight head (W network).
+    Shared SR network remains unchanged.
+    
+    Args:
+        master: Source Genome instance
+        replacee: Target Genome instance
+        agent_index: Index of the agent to clone (0 ~ n_agents-1)
+    
+    Raises:
+        ValueError: If genomes do not support agent-level operations
+    """
+    if not master.has_agent_level_support():
+        raise ValueError("Genome does not support agent-level operations. "
+                       "Use 'maco_agent_mac' controller for agent-level evolution.")
+    
+    master_W = master.get_agent_W(agent_index)
+    replacee_W = replacee.get_agent_W(agent_index)
+    
+    # Copy parameters from master to replacee
+    for target_param, source_param in zip(replacee_W.parameters(), master_W.parameters()):
+        target_param.data.copy_(source_param.data)
+
+
+# Helper Functions for Generalized Module Evolution
+def clone_module(master, replacee, module_index):
+    """
+    Clone a specific module (SR or Agent Head) from master to replacee.
+    module_index = -1 -> Clone SR (Shared Representation)
+    module_index >= 0 -> Clone Agent Head [module_index]
+    """
+    if module_index == -1:
+        # Clone SR
+        if hasattr(master.mac, 'agent_SR'):
+             for target_param, source_param in zip(replacee.mac.agent_SR.parameters(), master.mac.agent_SR.parameters()):
+                 target_param.data.copy_(source_param.data)
+    else:
+        # Clone Agent Head
+        clone_agent_level(master, replacee, module_index)
+
+def mutate_module(gene, module_index, args):
+    """
+    Mutate a specific module (SR or Agent Head).
+    module_index = -1 -> Mutate SR
+    module_index >= 0 -> Mutate Agent Head
+    """
+    if module_index == -1:
+        # Mutate SR
+        if hasattr(gene.mac, 'agent_SR'):
+             # Create a dummy wrapper or manually mutate parameters
+             # Using existing mutation logic implementation style:
+             mutate_params(gene.mac.agent_SR.parameters(), args)
+    else:
+        # Mutate Agent Head
+        mutate_agent_level(gene, module_index, args)
+
+def mutate_params(parameters, args):
+    """Applying Gaussian mutation to a list of parameters (reusing logic from mutate_inplace)"""
+    # Simply reusing the core logic logic would be best, avoiding code duplication
+    # Implementing simplified version here for robustness
+    
+    params_list = list(parameters)
+    num_params = len(params_list)
+    ssne_probabilities = np.random.uniform(0, 1, num_params) * 2
+    
+    # Need access to internal data, iter over params directly
+    for i, param in enumerate(params_list):
+        if len(param.data.shape) == 2: # Weights only
+             W = param.data
+             ssne_prob = 1.0
+             action_prob = ssne_probabilities[i]
+             
+             if random.random() < ssne_prob:
+                num_variables = W.shape[0]
+                for index in range(num_variables):
+                    if random.random() <= action_prob:
+                         index_list = random.sample(range(W.shape[1]), int(W.shape[1] * args.frac))
+                         random_num = random.random()
+                         if random_num < args.prob_reset_and_sup: # super mut
+                             for ind in index_list:
+                                 W[index, ind] += random.gauss(0, 1.0 * W[index, ind]) # super_strength=1.0
+                         elif random_num < args.prob_reset_and_sup * 2: # reset
+                             for ind in index_list:
+                                 W[index, ind] = random.gauss(0, 1)
+                         else:
+                             for ind in index_list:
+                                 W[index, ind] += random.gauss(0, 0.1 * W[index, ind]) # mut_strength=0.1
+                         
+                         W[index, :] = torch.from_numpy(np.clip(W[index, :].cpu().numpy(), a_min=-1000000, a_max=1000000)).to(W.device)

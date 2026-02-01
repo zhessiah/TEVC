@@ -10,4 +10,6 @@ results/
 .github/
 test*.py
 test*.sh
-install*.sh*.md
+install*.sh
+*.md
+RACE/
