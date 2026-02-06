@@ -171,8 +171,9 @@ def run(_run, _config, _log):
         #     tb_logs_direc = os.path.join(tb_logs_direc, "all_test_attack")
         # else:
         #     tb_logs_direc = os.path.join(tb_logs_direc, "no_attack")
-        
-        
+        if args.evaluate:
+            tb_logs_direc = os.path.join(tb_logs_direc, "evaluate")
+
         if "sc2" in args.env or "gfootball" in args.env:
             tb_logs_direc = os.path.join(tb_logs_direc, args.env_args["map_name"])
         elif "mpe" in args.env:
@@ -229,9 +230,61 @@ def run(_run, _config, _log):
 
 
 def evaluate_sequential(mac, args, runner):
-
+    """
+    Standard evaluation without attacks.
+    By default, does NOT use evaluate_mode (aggregates statistics across episodes).
+    """
     for _ in range(args.test_nepisode):
-        _, _ = runner.run(mac, test_mode=True)  # Unpack tuple, ignore attacker_stats
+        runner.run(mac, test_mode=True, evaluate_mode=False)
+
+    if args.save_replay:
+        runner.save_replay()
+
+    runner.close_env()
+    
+def evaluate_sequential_under_attack(mac, args, runner):
+    """
+    在攻击下评估模型性能,并记录详细的 episode 内部数据
+    
+    数据保存路径:
+    - TensorBoard 日志: {checkpoint_path}/evaluate/events.out.tfevents.xxxxx
+    - 数据格式: evaluate/ep{N}/reward, evaluate/ep{N}/global_q, 等
+    """
+    attacker = MLPAttacker(args)
+    
+    if args.checkpoint_path != "":
+
+        timesteps = []
+        timestep_to_load = 0
+
+        if not os.path.isdir(args.checkpoint_path):
+            return
+        
+        # Go through all files in args.checkpoint_path
+        for name in os.listdir(args.checkpoint_path):
+            full_name = os.path.join(args.checkpoint_path, name)
+            # Check if they are dirs the names of which are numbers
+            if os.path.isdir(full_name) and name.isdigit():
+                timesteps.append(int(name))
+
+        if args.load_step == 0:
+            # choose the max timestep
+            timestep_to_load = max(timesteps)
+        else:
+            # choose the timestep closest to load_step
+            timestep_to_load = min(timesteps, key=lambda x: abs(x - args.load_step))
+
+        model_path = os.path.join(args.checkpoint_path, str(timestep_to_load))
+
+        attacker.load_models(model_path)
+
+    # 设置 attacker
+    mac.mac1.set_attacker(attacker)
+    
+    # 运行 evaluate_mode,记录详细的 episode 内部数据
+    # 数据会自动保存到 TensorBoard (通过 logger.log_stat)
+    for _ in range(args.test_nepisode):
+        run_batch = runner.run_under_attack(mac, test_mode=True, evaluate_mode=True)
 
     if args.save_replay:
         runner.save_replay()
@@ -361,7 +414,7 @@ def run_sequential(args, logger):
 
         if args.evaluate or args.save_replay:
             if args.EA:
-                evaluate_sequential(genome, args, runner)
+                evaluate_sequential_under_attack(genome, args, runner)
             else:
                 evaluate_sequential(mac, args, runner)
             return
@@ -856,6 +909,8 @@ def run_sequential(args, logger):
             # learner should handle saving/loading -- delegate actor save/load to mac,
             # use appropriate filenames to do critics, optimizer states
             learner.save_models(save_path)
+            if args.EA and args.adversarial_training:
+                th.save(population_attackers[best_attackers[0]].state_dict(), "{}/attacker.th".format(save_path))
 
         episode += args.batch_size_run
 

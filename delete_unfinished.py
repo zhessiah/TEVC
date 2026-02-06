@@ -16,8 +16,8 @@ for map_name in os.listdir(ROOT_DIR):
         models_path = os.path.join(run_path, "models")
 
         if not os.path.isdir(models_path):
-            continue  # 没有 models 的，先别动
-
+            to_delete.append((run_path, -1))
+            continue
         steps = [int(d) for d in os.listdir(models_path) if d.isdigit()]
         if not steps:
             continue

@@ -90,6 +90,11 @@ class MLPAttacker(nn.Module):
         if self.buffer is None:
             raise RuntimeError("Buffer not initialized. Call setup_buffer() first.")
         self.buffer.insert_episode_batch(episode_batch)
+        
+    def load_models(self, path):
+        self.load_state_dict(
+            th.load("{}/attacker.th".format(path), map_location=lambda storage, loc: storage)
+        )
     
     # def train(self, logger=None, log_step=None):
     #     """

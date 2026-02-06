@@ -57,6 +57,9 @@ class Robust_ParallelRunner:
         self.attacker_population = []
         for i in range(self.attacker_pop_size):
             self.attacker_population.append(MLPAttacker(args))
+        
+        # Initialize global episode counter for evaluate_mode (persistent across multiple run_under_attack calls)
+        self.global_evaluate_episode_counter = 0
 
 
     def setup(self, scheme, groups, preprocess, mac):
@@ -257,7 +260,7 @@ class Robust_ParallelRunner:
         return self.batch
 
     
-    def run_under_attack(self, mac, test_mode=False):
+    def run_under_attack(self, mac, test_mode=False, evaluate_mode=False):
         """
         运行episode进行训练或测试（攻击版本 - 用于测试对抗鲁棒性）
         
@@ -267,6 +270,13 @@ class Robust_ParallelRunner:
         - log_prefix = "test_under_attack_"
         
         用于对抗训练的双测试模式。
+        
+        当 evaluate_mode=True 时，记录每个episode内部的详细数据：
+        - 每步的奖励
+        - 每个agent的局部Q值
+        - 系统整体Q值
+        - 攻击者的剩余预算
+        - 攻击者选择攻击哪个智能体
         """
         self.mac = mac
         self.reset()
@@ -280,6 +290,44 @@ class Robust_ParallelRunner:
         final_env_infos = []
         attack_cnts = [0 for _ in range(self.batch_size)]
         
+        # === Evaluate Mode: Initialize data collection for each episode ===
+        if evaluate_mode:
+            import os
+            from tensorboard_logger import Logger as TBLogger
+            
+            # Use the current experiment directory (with timestamp) as base
+            # This is where the main training logs are stored
+            if hasattr(self.args, 'model_path') and self.args.model_path:
+                base_log_dir = os.path.join(self.args.model_path, "evaluate_episodes")
+            else:
+                # Fallback to local_results_path if model_path not available
+                base_log_dir = os.path.join(self.args.local_results_path, "tb_logs", "evaluate_episodes")
+            
+            os.makedirs(base_log_dir, exist_ok=True)
+            
+            # Track within-episode data for each parallel environment
+            episode_data = []
+            cumulative_rewards = []  # Track cumulative reward for each environment
+            episode_step_counters = []  # Track step within current episode for each environment
+            episode_tb_loggers = []  # TensorBoard Logger instance for each environment's current episode
+            
+            for _ in range(self.batch_size):
+                episode_data.append({
+                    'rewards': [],         # Immediate reward at each step
+                    'agent_qs': [],        # List of [q_agent0, q_agent1, ...] per step
+                    'global_qs': [],       # Global Q value (sum of agent Qs)
+                    'victim_ids': [],      # Which agent is attacked (or n_agents if none)
+                    'left_attacks': []     # Remaining attack budget (normalized 0-1)
+                })
+                cumulative_rewards.append(0.0)  # Initialize cumulative reward to 0
+                episode_step_counters.append(0)  # Initialize episode step counter
+                episode_tb_loggers.append(None)  # Initialize logger placeholder
+            
+            # NOTE: Do NOT reset episode_counters here - use global persistent counter
+            # This ensures each episode gets a unique ID across multiple run_under_attack() calls
+            
+            global_step_counter = 0  # Global step counter across all episodes and environments
+        
         if test_mode==True:
             attack_num = self.args.num_attack_test
         else:
@@ -287,6 +335,34 @@ class Robust_ParallelRunner:
         
         while True:
             ori_actions, byzantine_actions, victim_id = self.mac.select_byzantine_actions(self.batch, t_ep=self.t, t_env=self.t_env, bs=envs_not_terminated, test_mode=test_mode)
+            
+            # Get Q values if in evaluate mode
+            selected_qs = None
+            global_qs = None
+            if evaluate_mode:
+                try:
+                    # Call forward with correct parameter name 't' instead of 't_ep'
+                    forward_output = self.mac.forward(self.batch, t=self.t, test_mode=test_mode)
+                    if isinstance(forward_output, tuple):
+                        agent_outs, qs = forward_output
+                    else:
+                        qs = forward_output
+                    # qs shape: [batch_size, n_agents, n_actions]
+                    selected_qs = []
+                    for b_idx in range(len(envs_not_terminated)):
+                        agent_qs = []
+                        for a_idx in range(self.args.n_agents):
+                            action = ori_actions[b_idx, a_idx].item()
+                            if action < qs.shape[-1]:
+                                agent_qs.append(qs[b_idx, a_idx, action].item())
+                            else:
+                                agent_qs.append(0.0)
+                        selected_qs.append(agent_qs)
+                    global_qs = [sum(sq) for sq in selected_qs]
+                except Exception as e:
+                    self.logger.console_logger.warning(f"[Evaluate Mode] Failed to get Q values: {e}")
+                    selected_qs = None
+                    global_qs = None
             
             actions_chosen = {
                 "actions": ori_actions.unsqueeze(1).to("cpu"),
@@ -348,6 +424,105 @@ class Robust_ParallelRunner:
                         env_terminated = True
                     terminated[idx] = data["terminated"]
                     post_transition_data["terminated"].append((env_terminated,))
+
+                    # === Evaluate Mode: Record within-episode data ===
+                    # Record data from ALL environments (each gets its own episode folder)
+                    if evaluate_mode and idx in envs_not_terminated:
+                        batch_idx = envs_not_terminated.index(idx)
+                        
+                        # Create new TensorBoard logger for this episode if not exists
+                        if episode_tb_loggers[idx] is None:
+                            # Create unique directory for this episode using global counter
+                            episode_log_dir = os.path.join(base_log_dir, f"episode_{self.global_evaluate_episode_counter}")
+                            # Create an independent Logger instance for this episode
+                            episode_tb_loggers[idx] = TBLogger(episode_log_dir)
+                            self.logger.console_logger.info(
+                                f"[Evaluate Mode] Starting Episode {self.global_evaluate_episode_counter} - "
+                                f"Logging to {episode_log_dir}"
+                            )
+                            # Increment counter immediately after creating logger to ensure unique episode IDs
+                            # for all parallel environments (critical for batch_size > 1)
+                            self.global_evaluate_episode_counter += 1
+                        
+                        # Update cumulative reward for this environment
+                        cumulative_rewards[idx] += data["reward"]
+                        
+                        # Get Q values for this environment
+                        selected_q = selected_qs[batch_idx] if selected_qs is not None else [0.0] * self.args.n_agents
+                        global_q = global_qs[batch_idx] if global_qs is not None else 0.0
+                        
+                        # Get victim ID (which agent is attacked)
+                        victim = victim_id[batch_idx].item()
+                        
+                        # Calculate remaining attack budget
+                        left_attack = 1 - attack_cnts[idx] / attack_num if attack_num else 0.0
+                        
+                        # Log data to episode-specific TensorBoard
+                        # Use episode_step_counters[idx] as x-axis (step within episode)
+                        episode_tb_loggers[idx].log_value("cumulative_reward", cumulative_rewards[idx], episode_step_counters[idx])
+                        episode_tb_loggers[idx].log_value("global_q", global_q, episode_step_counters[idx])
+                        
+                        # Log individual agent Q values
+                        for agent_id, agent_q in enumerate(selected_q):
+                            episode_tb_loggers[idx].log_value(f"agent{agent_id}_q", agent_q, episode_step_counters[idx])
+                        
+                        # Log victim ID (which agent is being attacked)
+                        episode_tb_loggers[idx].log_value("victim_id", victim, episode_step_counters[idx])
+                        
+                        # Log remaining attack budget
+                        episode_tb_loggers[idx].log_value("attack_budget", left_attack, episode_step_counters[idx])
+                        
+                        # Increment counters
+                        global_step_counter += 1
+                        episode_step_counters[idx] += 1
+                        
+                        # Store data for episode summary logging
+                        episode_data[idx]['rewards'].append(data["reward"])
+                        episode_data[idx]['agent_qs'].append(selected_q)
+                        episode_data[idx]['global_qs'].append(global_q)
+                        episode_data[idx]['victim_ids'].append(victim)
+                        episode_data[idx]['left_attacks'].append(left_attack)
+                        
+                        # If episode just terminated, reset logger and counters
+                        if data["terminated"]:
+                            num_steps = len(episode_data[idx]['rewards'])
+                            total_reward = sum(episode_data[idx]['rewards'])
+                            avg_q = sum(episode_data[idx]['global_qs']) / num_steps if num_steps > 0 else 0.0
+                            
+                            # Calculate average reward per step
+                            avg_reward = total_reward / num_steps if num_steps > 0 else 0.0
+                            
+                            # Get battle result (win=1, loss=0) from environment info
+                            battle_won = data["info"].get("battle_won", 0)
+                            win_value = 1 if battle_won else 0
+                            
+                            # Log battle result and average reward as scalar values (logged at final step)
+                            # This creates single values per episode
+                            episode_tb_loggers[idx].log_value("battle_won", win_value, episode_step_counters[idx] - 1)
+                            episode_tb_loggers[idx].log_value("average_reward", avg_reward, episode_step_counters[idx] - 1)
+                            
+                            # The episode number is global_counter - 1 (since we already incremented when creating)
+                            completed_episode_num = self.global_evaluate_episode_counter - 1
+                            win_status = "WON" if win_value == 1 else "LOST"
+                            self.logger.console_logger.info(
+                                f"[Evaluate Mode] Episode {completed_episode_num} completed ({win_status}): "
+                                f"{num_steps} steps, total_reward={total_reward:.2f}, avg_reward={avg_reward:.4f}, avg_q={avg_q:.2f}"
+                            )
+                            
+                            # Reset logger for next episode (tensorboard-logger doesn't need explicit close)
+                            episode_tb_loggers[idx] = None
+                            
+                            # Reset data for this environment (for next episode)
+                            episode_data[idx] = {
+                                'rewards': [],
+                                'agent_qs': [],
+                                'global_qs': [],
+                                'victim_ids': [],
+                                'left_attacks': []
+                            }
+                            cumulative_rewards[idx] = 0.0  # Reset cumulative reward for next episode
+                            episode_step_counters[idx] = 0  # Reset episode step counter
+                            # Note: Do NOT increment counter here - already incremented when creating logger
 
                     pre_transition_data["state"].append(data["state"])
                     pre_transition_data["avail_actions"].append(data["avail_actions"])
